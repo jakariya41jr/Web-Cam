@@ -15,14 +15,18 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
 import android.view.Surface
+import com.example.data.VirtualCamRepository
+import com.example.model.AppPreset
 import com.example.model.MediaKind
 import com.example.model.VirtualCamConstants
 import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.XposedBridge
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.min
 
 data class HookRuntimeState(
     val enabled: Boolean = false,
@@ -33,14 +37,30 @@ data class HookRuntimeState(
     val mirrorHorizontal: Boolean = false,
     val rotationDegrees: Int = 0,
     val allowAllScopedApps: Boolean = true,
+    val autoApplyPresets: Boolean = true,
     val mediaKind: MediaKind = MediaKind.NONE,
     val mediaPath: String = "",
     val mediaMime: String = "",
     val mediaWidth: Int = 0,
     val mediaHeight: Int = 0,
     val mediaUpdatedAtMs: Long = 0L,
-    val enabledPackages: Set<String> = emptySet()
+    val enabledPackages: Set<String> = emptySet(),
+    val appPresets: Map<String, AppPreset> = emptyMap()
 ) {
+    fun withPresetFor(packageName: String, processName: String = packageName): HookRuntimeState {
+        if (!autoApplyPresets || appPresets.isEmpty()) return this
+        val hostPkg = resolveHostPackage(packageName, processName)
+        val preset = appPresets[hostPkg] ?: appPresets[packageName] ?: return this
+        return copy(
+            forceBypass = forceBypass || !preset.virtualModeEnabled,
+            audioEnabled = preset.audioEnabled,
+            micEnabled = preset.micEnabled,
+            loopVideo = preset.loopVideo,
+            mirrorHorizontal = preset.mirrorHorizontal,
+            rotationDegrees = preset.rotationDegrees
+        )
+    }
+
     fun isScopedTarget(packageName: String, processName: String = packageName): Boolean {
         if (allowAllScopedApps) return true
         val hostPkg = resolveHostPackage(packageName, processName)
@@ -77,14 +97,21 @@ data class ReaderSurfaceSpec(
     val maxImages: Int
 )
 
+data class DirectYuvPlaneBuffers(
+    val yBuf: ByteBuffer,
+    val uBuf: ByteBuffer,
+    val vBuf: ByteBuffer
+)
+
 /**
  * Shared media/config bridge used inside hooked camera & audio target processes.
  * Combines LSPosed New XSharedPreferences (API 93+) with VirtualCamMediaProvider IPC
- * and drives Surface Canvas + ImageWriter YUV_420_888 rendering at ~30 fps.
+ * and drives Surface Canvas + ImageWriter YUV_420_888 rendering + Direct-ByteBuffer plane fallback.
  */
 object HookMediaBridge {
     private const val TAG = "[VirtualCam]"
     private const val STATE_CACHE_TTL_MS = 200L
+    private const val PLANE_POOL_SLOTS = 4
 
     @Volatile
     private var cachedPrefs: XSharedPreferences? = null
@@ -95,8 +122,17 @@ object HookMediaBridge {
     @Volatile
     private var cachedState: HookRuntimeState = HookRuntimeState()
 
+    @Volatile
+    private var lastPrefsErrorMs: Long = 0L
+
     private val activeRenderers = ConcurrentHashMap<Int, VirtualSurfaceRenderer>()
     private val imageReaderSpecs = ConcurrentHashMap<Int, ReaderSurfaceSpec>()
+    private val directPlaneSurfaces = ConcurrentHashMap.newKeySet<Int>()
+
+    private val planePoolLock = Any()
+    private val planePool = ArrayList<DirectYuvPlaneBuffers>(PLANE_POOL_SLOTS)
+    private var planePoolCursor = 0
+    private var planePoolKey = ""
 
     fun currentAppContext(): Context? =
         runCatching { AndroidAppHelper.currentApplication() }.getOrNull()
@@ -108,12 +144,29 @@ object HookMediaBridge {
 
     fun unregisterImageReaderSurface(surface: Surface?) {
         if (surface == null) return
-        imageReaderSpecs.remove(System.identityHashCode(surface))
+        val key = System.identityHashCode(surface)
+        imageReaderSpecs.remove(key)
+        directPlaneSurfaces.remove(key)
     }
 
     fun getImageReaderSpec(surface: Surface?): ReaderSurfaceSpec? {
         if (surface == null) return null
         return imageReaderSpecs[System.identityHashCode(surface)]
+    }
+
+    fun markSurfaceDirectPlaneFallback(surface: Surface?) {
+        if (surface == null) return
+        directPlaneSurfaces.add(System.identityHashCode(surface))
+    }
+
+    fun isDirectPlaneFallbackActive(surface: Surface?): Boolean {
+        if (surface == null) return false
+        return directPlaneSurfaces.contains(System.identityHashCode(surface))
+    }
+
+    fun hasActiveImageWriter(surface: Surface?): Boolean {
+        if (surface == null) return false
+        return activeRenderers[System.identityHashCode(surface)]?.hasImageWriter() == true
     }
 
     fun readRuntimeState(
@@ -124,7 +177,7 @@ object HookMediaBridge {
     ): HookRuntimeState {
         val now = System.currentTimeMillis()
         if (!forceRefresh && (now - lastStateReadMs) < STATE_CACHE_TTL_MS) {
-            return cachedState
+            return cachedState.withPresetFor(packageName, processName)
         }
 
         // 1. Primary: New XSharedPreferences (LSPosed Binder proxy when xposedsharedprefs=true)
@@ -139,6 +192,10 @@ object HookMediaBridge {
 
             if (prefs.file.canRead() || prefs.hasFileChanged()) {
                 prefs.reload()
+                val presetEntries = prefs.getStringSet(
+                    VirtualCamConstants.KEY_APP_PRESETS_SET,
+                    emptySet()
+                ).orEmpty()
                 val loaded = HookRuntimeState(
                     enabled = prefs.getBoolean(VirtualCamConstants.KEY_ENABLED, false),
                     forceBypass = prefs.getBoolean(VirtualCamConstants.KEY_FORCE_BYPASS, false),
@@ -148,6 +205,7 @@ object HookMediaBridge {
                     mirrorHorizontal = prefs.getBoolean(VirtualCamConstants.KEY_MIRROR_HORIZONTAL, false),
                     rotationDegrees = prefs.getInt(VirtualCamConstants.KEY_ROTATION_DEGREES, 0),
                     allowAllScopedApps = prefs.getBoolean(VirtualCamConstants.KEY_ALLOW_ALL_SCOPED, true),
+                    autoApplyPresets = prefs.getBoolean(VirtualCamConstants.KEY_AUTO_APPLY_PRESETS, true),
                     mediaKind = MediaKind.fromWire(prefs.getString(VirtualCamConstants.KEY_MEDIA_KIND, null)),
                     mediaPath = prefs.getString(VirtualCamConstants.KEY_MEDIA_PATH, "").orEmpty(),
                     mediaMime = prefs.getString(VirtualCamConstants.KEY_MEDIA_MIME, "").orEmpty(),
@@ -155,14 +213,18 @@ object HookMediaBridge {
                     mediaHeight = prefs.getInt(VirtualCamConstants.KEY_MEDIA_HEIGHT, 0),
                     mediaUpdatedAtMs = prefs.getLong(VirtualCamConstants.KEY_MEDIA_UPDATED_AT, 0L),
                     enabledPackages = prefs.getStringSet(VirtualCamConstants.KEY_ENABLED_PACKAGES, emptySet())
-                        ?: emptySet()
+                        ?: emptySet(),
+                    appPresets = VirtualCamRepository.decodeAppPresets(presetEntries)
                 )
                 cachedState = loaded
                 lastStateReadMs = now
-                return loaded
+                return loaded.withPresetFor(packageName, processName)
             }
         } catch (t: Throwable) {
-            XposedBridge.log("$TAG XSharedPreferences read failed for $packageName ($processName): ${t.message}")
+            if (now - lastPrefsErrorMs > 10_000L) {
+                lastPrefsErrorMs = now
+                XposedBridge.log("$TAG XSharedPreferences fallback to provider for $packageName ($processName): ${t.message}")
+            }
         }
 
         // 2. Fallback: Query exported VirtualCamMediaProvider
@@ -189,6 +251,13 @@ object HookMediaBridge {
                             return if (idx >= 0) cursor.getString(idx).orEmpty() else ""
                         }
 
+                        val rawPresets = strCol(VirtualCamConstants.KEY_APP_PRESETS_SET)
+                        val presetSet = if (rawPresets.isBlank()) {
+                            emptySet()
+                        } else {
+                            rawPresets.split(";;").filter { it.isNotBlank() }.toSet()
+                        }
+
                         val loaded = HookRuntimeState(
                             enabled = intCol(VirtualCamConstants.KEY_ENABLED) == 1,
                             forceBypass = intCol(VirtualCamConstants.KEY_FORCE_BYPASS) == 1,
@@ -198,22 +267,24 @@ object HookMediaBridge {
                             mirrorHorizontal = intCol(VirtualCamConstants.KEY_MIRROR_HORIZONTAL) == 1,
                             rotationDegrees = intCol(VirtualCamConstants.KEY_ROTATION_DEGREES, 0),
                             allowAllScopedApps = intCol(VirtualCamConstants.KEY_ALLOW_ALL_SCOPED, 1) == 1,
+                            autoApplyPresets = intCol(VirtualCamConstants.KEY_AUTO_APPLY_PRESETS, 1) == 1,
                             mediaKind = MediaKind.fromWire(strCol(VirtualCamConstants.KEY_MEDIA_KIND)),
                             mediaPath = strCol(VirtualCamConstants.KEY_MEDIA_PATH),
                             mediaMime = strCol(VirtualCamConstants.KEY_MEDIA_MIME),
                             mediaWidth = intCol(VirtualCamConstants.KEY_MEDIA_WIDTH),
                             mediaHeight = intCol(VirtualCamConstants.KEY_MEDIA_HEIGHT),
-                            mediaUpdatedAtMs = longCol(VirtualCamConstants.KEY_MEDIA_UPDATED_AT)
+                            mediaUpdatedAtMs = longCol(VirtualCamConstants.KEY_MEDIA_UPDATED_AT),
+                            appPresets = VirtualCamRepository.decodeAppPresets(presetSet)
                         )
                         cachedState = loaded
                         lastStateReadMs = now
-                        return loaded
+                        return loaded.withPresetFor(packageName, processName)
                     }
                 }
             }
         }
 
-        return cachedState
+        return cachedState.withPresetFor(packageName, processName)
     }
 
     fun openActiveMediaPfd(context: Context?, fallbackPath: String): ParcelFileDescriptor? {
@@ -277,6 +348,110 @@ object HookMediaBridge {
     fun stopAllRenderers() {
         activeRenderers.values.forEach { runCatching { it.stop() } }
         activeRenderers.clear()
+    }
+
+    /**
+     * Generates direct-allocated Y/U/V ByteBuffers matching an existing ImageReader's SurfacePlane strides.
+     * Used as a zero-conflict fallback when ImageWriter cannot attach to a native window (fixes black screen
+     * on WhatsApp / OmeTV WebRTC pipelines while keeping JNI GetDirectBufferAddress non-null).
+     */
+    fun buildDirectYuvPlanesForImage(
+        context: Context?,
+        state: HookRuntimeState,
+        width: Int,
+        height: Int,
+        yRowStride: Int,
+        yPixStride: Int,
+        uRowStride: Int,
+        uPixStride: Int,
+        vRowStride: Int,
+        vPixStride: Int,
+        yCap: Int,
+        uCap: Int,
+        vCap: Int
+    ): DirectYuvPlaneBuffers? {
+        if (width <= 1 || height <= 1 || yCap <= 0 || uCap <= 0 || vCap <= 0) return null
+        val source = VideoFramePipeline.getCurrentFrameBitmap(context, state) ?: return null
+        val fitted = VideoFramePipeline.renderFittedBitmap(
+            source = source,
+            targetW = width,
+            targetH = height,
+            mirrorHorizontal = state.mirrorHorizontal,
+            rotationDegrees = state.rotationDegrees
+        )
+        source.recycle()
+
+        val buffers = acquireDirectPlaneSlot(yCap, uCap, vCap)
+        return try {
+            val argb = IntArray(width * height)
+            fitted.getPixels(argb, 0, width, 0, 0, width, height)
+
+            val yBuf = buffers.yBuf
+            val uBuf = buffers.uBuf
+            val vBuf = buffers.vBuf
+
+            for (j in 0 until height) {
+                val yRowBase = j * yRowStride
+                val uRowBase = (j / 2) * uRowStride
+                val vRowBase = (j / 2) * vRowStride
+
+                for (i in 0 until width) {
+                    val pixel = argb[j * width + i]
+                    val r = (pixel shr 16) and 0xFF
+                    val g = (pixel shr 8) and 0xFF
+                    val b = pixel and 0xFF
+
+                    val y = (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16).coerceIn(0, 255)
+                    val yIdx = yRowBase + i * yPixStride
+                    if (yIdx < yCap) {
+                        yBuf.put(yIdx, y.toByte())
+                    }
+
+                    if (j % 2 == 0 && i % 2 == 0) {
+                        val u = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128).coerceIn(0, 255)
+                        val v = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128).coerceIn(0, 255)
+                        val uvCol = i / 2
+                        val uIdx = uRowBase + uvCol * uPixStride
+                        val vIdx = vRowBase + uvCol * vPixStride
+                        if (uIdx < uCap) uBuf.put(uIdx, u.toByte())
+                        if (vIdx < vCap) vBuf.put(vIdx, v.toByte())
+                    }
+                }
+            }
+
+            yBuf.position(0).limit(yCap)
+            uBuf.position(0).limit(uCap)
+            vBuf.position(0).limit(vCap)
+            buffers
+        } finally {
+            fitted.recycle()
+        }
+    }
+
+    private fun acquireDirectPlaneSlot(yCap: Int, uCap: Int, vCap: Int): DirectYuvPlaneBuffers {
+        val key = "$yCap:$uCap:$vCap"
+        synchronized(planePoolLock) {
+            if (planePoolKey != key) {
+                planePool.clear()
+                planePoolCursor = 0
+                planePoolKey = key
+            }
+            if (planePool.size < PLANE_POOL_SLOTS) {
+                val slot = DirectYuvPlaneBuffers(
+                    yBuf = ByteBuffer.allocateDirect(yCap),
+                    uBuf = ByteBuffer.allocateDirect(uCap),
+                    vBuf = ByteBuffer.allocateDirect(vCap)
+                )
+                planePool.add(slot)
+                return slot
+            }
+            val slot = planePool[planePoolCursor]
+            planePoolCursor = (planePoolCursor + 1) % PLANE_POOL_SLOTS
+            slot.yBuf.clear()
+            slot.uBuf.clear()
+            slot.vBuf.clear()
+            return slot
+        }
     }
 
     fun encodeJpegFromActiveMedia(packageName: String, processName: String = packageName): ByteArray? {
@@ -346,8 +521,10 @@ object HookMediaBridge {
 
 /**
  * Renders 30fps frames onto a target Surface:
- * - For ImageReader (YUV_420_888) surfaces: writes genuine Y/U/V frames via ImageWriter.
- * - For SurfaceView / SurfaceTexture / MediaRecorder surfaces: blits fitted frames via lockHardwareCanvas/lockCanvas.
+ * - For ImageReader (YUV_420_888) surfaces: writes genuine Y/U/V frames via ImageWriter, or falls back
+ *   to direct-ByteBuffer ImageReader plane injection if ImageWriter cannot connect to the native window.
+ * - For SurfaceView / SurfaceTexture / MediaRecorder surfaces: blits fitted frames via lockHardwareCanvas/lockCanvas,
+ *   with automatic safe fallback if the surface persistently rejects Canvas locking.
  * - Supports live instant switching between Virtual Feed and Bypass/Real Camera via [passthroughProvider].
  */
 class VirtualSurfaceRenderer(
@@ -362,6 +539,10 @@ class VirtualSurfaceRenderer(
     private var renderHandler: Handler? = null
     private var imageWriter: ImageWriter? = null
     private var consumerAcquired = false
+    private var directPlaneMode = false
+    private var consecutiveCanvasFailures = 0
+
+    fun hasImageWriter(): Boolean = imageWriter != null && running.get()
 
     fun start(context: Context?, initialState: HookRuntimeState) {
         if (!running.compareAndSet(false, true)) return
@@ -375,13 +556,19 @@ class VirtualSurfaceRenderer(
             consumerAcquired = true
         }
 
-        // Attach ImageWriter only for YUV_420_888 ImageReader surfaces
+        // Attach ImageWriter for YUV_420_888 ImageReader surfaces; fall back safely to direct-plane injection on failure
         val spec = readerSpec
         if (spec != null && spec.format == ImageFormat.YUV_420_888) {
             runCatching {
                 imageWriter = ImageWriter.newInstance(surface, spec.maxImages.coerceIn(2, 4))
             }.onFailure { err ->
-                XposedBridge.log("[VirtualCam] ImageWriter attach skipped: ${err.message ?: err.javaClass.simpleName}")
+                directPlaneMode = true
+                HookMediaBridge.markSurfaceDirectPlaneFallback(surface)
+                XposedBridge.log(
+                    "[VirtualCam] Safe fallback for $packageName (${spec.width}x${spec.height}): " +
+                        "ImageWriter unavailable (${err.message ?: err.javaClass.simpleName}); " +
+                        "activated direct-ByteBuffer plane injection"
+                )
             }
         }
 
@@ -410,22 +597,38 @@ class VirtualSurfaceRenderer(
                     consumerAcquired = false
                 }
 
-                val frameBitmap: Bitmap? = if (useVirtual) {
-                    VideoFramePipeline.getCurrentFrameBitmap(context, liveState)
-                } else {
-                    passthroughProvider?.invoke()
-                }
+                // In directPlaneMode, ImageReader.acquireLatestImage() hooks consume VideoFramePipeline directly
+                if (!directPlaneMode) {
+                    val frameBitmap: Bitmap? = if (useVirtual) {
+                        VideoFramePipeline.getCurrentFrameBitmap(context, liveState)
+                    } else {
+                        passthroughProvider?.invoke()
+                    }
 
-                if (frameBitmap != null && !frameBitmap.isRecycled) {
-                    try {
-                        val writer = imageWriter
-                        if (writer != null && readerSpec != null) {
-                            pumpToImageWriter(writer, readerSpec, frameBitmap, liveState, useVirtual)
-                        } else if (readerSpec == null) {
-                            pumpToCanvasSurface(frameBitmap, liveState, useVirtual, paint)
+                    if (frameBitmap != null && !frameBitmap.isRecycled) {
+                        try {
+                            val writer = imageWriter
+                            if (writer != null && readerSpec != null) {
+                                pumpToImageWriter(writer, readerSpec, frameBitmap, liveState, useVirtual)
+                            } else if (readerSpec == null) {
+                                val ok = pumpToCanvasSurface(frameBitmap, liveState, useVirtual, paint)
+                                if (ok) {
+                                    consecutiveCanvasFailures = 0
+                                } else {
+                                    consecutiveCanvasFailures++
+                                    if (consecutiveCanvasFailures >= 20) {
+                                        XposedBridge.log(
+                                            "[VirtualCam] Safe fallback for $packageName: preview Canvas surface rejected 20 frames; " +
+                                                "pausing renderer cleanly to protect host app"
+                                        )
+                                        stop()
+                                        return
+                                    }
+                                }
+                            }
+                        } finally {
+                            if (!frameBitmap.isRecycled) frameBitmap.recycle()
                         }
-                    } finally {
-                        if (!frameBitmap.isRecycled) frameBitmap.recycle()
                     }
                 }
 
@@ -457,7 +660,7 @@ class VirtualSurfaceRenderer(
                 VideoFramePipeline.writeBitmapToYuvImage(fitted, destImage)
                 destImage.timestamp = System.nanoTime()
                 writer.queueInputImage(destImage)
-            } catch (t: Throwable) {
+            } catch (_: Throwable) {
                 runCatching { destImage.close() }
             }
         } catch (_: IllegalStateException) {
@@ -474,15 +677,15 @@ class VirtualSurfaceRenderer(
         state: HookRuntimeState,
         applyTransforms: Boolean,
         paint: Paint
-    ) {
+    ): Boolean {
         var canvas: Canvas? = null
-        try {
+        return try {
             canvas = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 surface.lockHardwareCanvas()
             } else {
                 surface.lockCanvas(null)
             }
-            if (canvas == null) return
+            if (canvas == null) return false
 
             canvas.drawColor(Color.BLACK)
             val cw = canvas.width.toFloat().coerceAtLeast(2f)
@@ -504,8 +707,9 @@ class VirtualSurfaceRenderer(
                 postTranslate(cw / 2f, ch / 2f)
             }
             canvas.drawBitmap(source, matrix, paint)
+            true
         } catch (_: Throwable) {
-            // Surface transitioning or owned by another consumer
+            false
         } finally {
             if (canvas != null) {
                 runCatching { surface.unlockCanvasAndPost(canvas) }

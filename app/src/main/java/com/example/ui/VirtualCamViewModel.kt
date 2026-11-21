@@ -6,6 +6,8 @@ import android.provider.Settings
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.VirtualCamRepository
+import com.example.diagnostics.LogCollector
+import com.example.model.AppPreset
 import com.example.model.MediaKind
 import com.example.model.SelectedMediaInfo
 import com.example.model.TargetAppScope
@@ -21,6 +23,9 @@ data class VirtualCamUiState(
     val canDrawOverlays: Boolean = false,
     val isImporting: Boolean = false,
     val isPreviewPlaying: Boolean = true,
+    val logs: List<String> = emptyList(),
+    val isCollectingLogs: Boolean = false,
+    val useRootLogs: Boolean = false,
     val feedbackMessage: String? = null
 )
 
@@ -32,10 +37,20 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
     private val _uiState = MutableStateFlow(
         VirtualCamUiState(
             config = repository.loadConfig(),
-            canDrawOverlays = Settings.canDrawOverlays(appContext)
+            canDrawOverlays = Settings.canDrawOverlays(appContext),
+            logs = LogCollector.getInternalEvents()
         )
     )
     val uiState: StateFlow<VirtualCamUiState> = _uiState.asStateFlow()
+
+    init {
+        val cfg = _uiState.value.config
+        LogCollector.recordEvent(
+            "App",
+            "Loaded config: armed=${cfg.isEffectivelyArmed}, lsposed=${cfg.lsposedActive}, worldReadable=${cfg.worldReadableActive}"
+        )
+        refreshLogs()
+    }
 
     fun refreshStatus() {
         val loaded = repository.loadConfig()
@@ -61,6 +76,11 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
                             selectedMedia = mediaInfo
                         )
                     )
+                    LogCollector.recordEvent(
+                        "Media",
+                        "Imported ${mediaInfo.displayName} (${mediaInfo.width}x${mediaInfo.height}, " +
+                            "${mediaInfo.fps.toInt()}fps, audio=${mediaInfo.hasAudioTrack}, codec=${mediaInfo.videoCodec.ifBlank { "unknown" }})"
+                    )
                     _uiState.update {
                         it.copy(
                             config = updated,
@@ -69,14 +89,17 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
                             feedbackMessage = "Persisted ${mediaInfo.displayName} to module storage"
                         )
                     }
+                    refreshLogs()
                 },
                 onFailure = { error ->
+                    LogCollector.recordEvent("Media", "Import failed: ${error.message}")
                     _uiState.update {
                         it.copy(
                             isImporting = false,
                             feedbackMessage = "Import failed: ${error.message ?: "Unable to read URI"}"
                         )
                     }
+                    refreshLogs()
                 }
             )
         }
@@ -92,12 +115,14 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
                     selectedMedia = SelectedMediaInfo()
                 )
             )
+            LogCollector.recordEvent("Media", "Cleared persisted virtual media")
             _uiState.update {
                 it.copy(
                     config = updated,
                     feedbackMessage = "Cleared persisted virtual camera media"
                 )
             }
+            refreshLogs()
         }
     }
 
@@ -108,12 +133,14 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
                 forceBypass = if (enabled) false else forceBypass
             )
         }
+        LogCollector.recordEvent("Control", "Virtual Camera ${if (enabled) "ENABLED" else "STANDBY"}")
     }
 
     fun toggleQuickBypass() {
         val current = _uiState.value.config
         val nextBypass = !current.forceBypass
         updateConfig { copy(forceBypass = nextBypass) }
+        LogCollector.recordEvent("Control", if (nextBypass) "Bypass ON (Real Camera)" else "Bypass OFF (Virtual Feed)")
         _uiState.update {
             it.copy(
                 feedbackMessage = if (nextBypass) {
@@ -127,10 +154,12 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
 
     fun setAudioEnabled(enabled: Boolean) {
         updateConfig { copy(audioEnabled = enabled) }
+        LogCollector.recordEvent("Audio", "Video Audio -> ${if (enabled) "ON" else "OFF"}")
     }
 
     fun setMicEnabled(enabled: Boolean) {
         updateConfig { copy(micEnabled = enabled) }
+        LogCollector.recordEvent("Audio", "Main Mic -> ${if (enabled) "ON" else "MUTED"}")
     }
 
     fun setLoopVideo(loop: Boolean) {
@@ -153,6 +182,57 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
 
     fun setAllowAllScopedApps(allow: Boolean) {
         updateConfig { copy(allowAllScopedApps = allow) }
+    }
+
+    fun setAutoApplyPresets(autoApply: Boolean) {
+        updateConfig { copy(autoApplyPresets = autoApply) }
+        LogCollector.recordEvent("Presets", "Auto-apply per-app presets -> $autoApply")
+    }
+
+    fun saveCurrentAsPreset(packageName: String) {
+        val cfg = _uiState.value.config
+        val preset = AppPreset(
+            packageName = packageName,
+            virtualModeEnabled = !cfg.forceBypass,
+            audioEnabled = cfg.audioEnabled,
+            micEnabled = cfg.micEnabled,
+            loopVideo = cfg.loopVideo,
+            mirrorHorizontal = cfg.mirrorHorizontal,
+            rotationDegrees = cfg.rotationDegrees
+        )
+        updateConfig {
+            copy(appPresets = appPresets + (packageName to preset))
+        }
+        LogCollector.recordEvent(
+            "Presets",
+            "Saved preset for $packageName (vcam=${preset.virtualModeEnabled}, vidAudio=${preset.audioEnabled}, mic=${preset.micEnabled}, rot=${preset.rotationDegrees}°)"
+        )
+        _uiState.update { it.copy(feedbackMessage = "Saved current settings as preset for $packageName") }
+    }
+
+    fun applyPreset(packageName: String) {
+        val preset = _uiState.value.config.appPresets[packageName] ?: return
+        updateConfig {
+            copy(
+                enabled = true,
+                forceBypass = !preset.virtualModeEnabled,
+                audioEnabled = preset.audioEnabled,
+                micEnabled = preset.micEnabled,
+                loopVideo = preset.loopVideo,
+                mirrorHorizontal = preset.mirrorHorizontal,
+                rotationDegrees = preset.rotationDegrees
+            )
+        }
+        LogCollector.recordEvent("Presets", "Applied preset for $packageName")
+        _uiState.update { it.copy(feedbackMessage = "Applied preset for $packageName") }
+    }
+
+    fun deletePreset(packageName: String) {
+        updateConfig {
+            copy(appPresets = appPresets - packageName)
+        }
+        LogCollector.recordEvent("Presets", "Removed preset for $packageName")
+        _uiState.update { it.copy(feedbackMessage = "Reset preset for $packageName") }
     }
 
     fun toggleTargetApp(packageName: String) {
@@ -193,12 +273,45 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
             isBuiltIn = false
         )
         updateConfig { copy(targetApps = targetApps + newScope) }
+        LogCollector.recordEvent("Scopes", "Added custom scope $pkg")
         _uiState.update { it.copy(feedbackMessage = "Added $pkg to target scopes") }
     }
 
     fun removeCustomTargetApp(packageName: String) {
         updateConfig {
-            copy(targetApps = targetApps.filterNot { it.packageName == packageName && !it.isBuiltIn })
+            copy(
+                targetApps = targetApps.filterNot { it.packageName == packageName && !it.isBuiltIn },
+                appPresets = appPresets - packageName
+            )
+        }
+    }
+
+    fun setUseRootLogs(useRoot: Boolean) {
+        _uiState.update { it.copy(useRootLogs = useRoot) }
+        refreshLogs(useRootOverride = useRoot)
+    }
+
+    fun refreshLogs(useRootOverride: Boolean? = null) {
+        val useRoot = useRootOverride ?: _uiState.value.useRootLogs
+        viewModelScope.launch {
+            _uiState.update { it.copy(isCollectingLogs = true) }
+            val result = LogCollector.collectLogs(useRoot = useRoot)
+            _uiState.update { state ->
+                state.copy(
+                    isCollectingLogs = false,
+                    logs = result.getOrElse { listOf("Log collection error: ${it.message}") }
+                )
+            }
+        }
+    }
+
+    fun clearLogs() {
+        LogCollector.clearInternalEvents()
+        _uiState.update {
+            it.copy(
+                logs = listOf("=== VirtualCam App Events ===", "(Cleared)"),
+                feedbackMessage = "Cleared diagnostic log buffer"
+            )
         }
     }
 

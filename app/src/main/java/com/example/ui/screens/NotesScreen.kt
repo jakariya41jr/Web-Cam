@@ -1,12 +1,20 @@
 package com.example.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -15,33 +23,52 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FolderSpecial
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.example.model.VirtualCamConfig
 import com.example.model.VirtualCamConstants
+import com.example.ui.VirtualCamUiState
 
 @Composable
 fun NotesScreen(
-    config: VirtualCamConfig,
+    state: VirtualCamUiState,
+    onToggleUseRootLogs: (Boolean) -> Unit,
+    onRefreshLogs: () -> Unit,
+    onClearLogs: () -> Unit,
+    onLogsCopied: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val config = state.config
     val scrollState = rememberScrollState()
+    val context = LocalContext.current
 
     Column(
         modifier = modifier
@@ -56,32 +83,48 @@ fun NotesScreen(
                 .widthIn(max = 640.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
+            LogCollectorCard(
+                logs = state.logs,
+                isCollecting = state.isCollectingLogs,
+                useRootLogs = state.useRootLogs,
+                onToggleUseRootLogs = onToggleUseRootLogs,
+                onRefreshLogs = onRefreshLogs,
+                onClearLogs = onClearLogs,
+                onCopyLogs = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    clipboard?.setPrimaryClip(
+                        ClipData.newPlainText("VirtualCam Logs", state.logs.joinToString("\n"))
+                    )
+                    onLogsCopied()
+                }
+            )
+
             NoteCard(
                 icon = Icons.Default.CameraAlt,
-                title = "Imo Crash & WhatsApp/OmeTV Black Screen Fix",
+                title = "Imo, WhatsApp & OmeTV Video Pipeline",
                 tag = "VideoFramePipeline",
-                body = "• MediaCodec + ImageWriter Pipeline: Replaces fragile MediaPlayer.setSurface() on Camera2/ImageReader surfaces (which caused 'Video renderer fallback: null') with a dedicated MediaCodec YUV_420_888 decoder feeding ImageWriter at 30fps and Canvas preview surfaces.\n• SessionConfiguration Replacement: Rewrites API 28+ SessionConfiguration and CaptureRequest.Builder.addTarget(...) consistently with a per-device draining bridge surface so CameraCaptureSession never mismatches outputs or crashes Imo.\n• WebRTC Buffer Identity: Camera1.setPreviewCallbackWithBuffer mutates the app's registered NV21 byte[] in-place and resolves com.google.android.webview host processes (omegle.tv, imo)."
+                body = "• MediaCodec + ImageWriter + Direct-Plane Fallback: Feeds MediaCodec YUV_420_888 frames through ImageWriter at 30fps, and if ImageWriter encounters 'Failed to connect to native window', automatically falls back to direct-ByteBuffer ImageReader.acquireLatestImage() SurfacePlane injection.\n• Deferred OutputConfiguration & SessionConfiguration: Hooks finalizeOutputConfigurations and multi-surface OutputConfiguration.getSurfaces() so WebRTC / Camera2Session never misses virtual frame replacement."
             )
 
             NoteCard(
                 icon = Icons.Default.GraphicEq,
-                title = "Independent Video Sound & Device Mic Routing",
+                title = "Independent Video Sound & Main Mic Routing",
                 tag = "AudioRecord Hooks",
-                body = "AudioHooks intercepts AudioRecord.read(...) inside scoped call apps. Toggle 'Main Device Microphone' off to zero out hardware mic samples cleanly, and toggle 'Video Audio (Send to Call)' on to decode and resample the selected video's audio track directly into the call stream without acoustic speaker echo."
+                body = "AudioHooks intercepts AudioRecord.startRecording() and read(byte[] / short[] / float[] / ByteBuffer) with soft-gain mixing (0.65x mic + 0.85x video audio, or 0.95x video audio when mic is muted) so video sound reaches imo/WhatsApp calls without acoustic echo or WebRTC clipping."
             )
 
             NoteCard(
                 icon = Icons.Default.Layers,
-                title = "Floating Quick-Switch Overlay",
+                title = "Floating Quick-Switch Overlay & Safe Fallback",
                 tag = "SYSTEM_ALERT_WINDOW",
-                body = "Grant Display Over Other Apps to launch a draggable floating pill over WhatsApp, Imo, or OmeTV. Tap the pill to toggle Virtual Camera vs. Real Camera instantaneously without restarting the call, or expand it for live Video Sound and Device Mic switches."
+                body = "Grant Display Over Other Apps to launch a draggable floating pill over active calls. Tap the pill to swap Virtual <-> Original/Bypass instantaneously without restarting the call, or expand it for live Video Audio and Main Mic toggles."
             )
 
             NoteCard(
                 icon = Icons.Default.FolderSpecial,
                 title = "Scoped Storage & Zero-Permission Media Picker",
                 tag = "Android 11–15+",
-                body = "Uses Android Photo Picker (PickVisualMedia) and Storage Access Framework (OpenDocument). Picked streams are copied into internal filesDir/virtual_cam_media/active_media.* so URI grants never expire across process restarts."
+                body = "Uses Android Photo Picker (PickVisualMedia) and Storage Access Framework (OpenDocument). Picked streams are copied into internal filesDir/virtual_cam_media/active_media.* and inspected for resolution, FPS, codec, and audio tracks."
             )
 
             NoteCard(
@@ -93,14 +136,173 @@ fun NotesScreen(
 
             NoteCard(
                 icon = Icons.Default.Security,
-                title = "SELinux & LSPosed Scope Notes",
+                title = "SELinux & LSPosed Reinstall Checklist",
                 tag = "Runtime",
-                body = "Make sure target apps (WhatsApp, imo, OmeTV, System WebView if applicable) are checked in LSPosed Manager under Modules → VirtualCam.\n" +
+                body = "After updating or reinstalling VirtualCam APK, force-stop target apps (WhatsApp, imo, OmeTV) once so LSPosed reloads the new APK path instead of logging a stale NoSuchFileException.\n" +
                     "Package: ${VirtualCamConstants.MODULE_PACKAGE}\n" +
                     "Prefs Mode: ${if (config.worldReadableActive) "MODE_WORLD_READABLE" else "MODE_PRIVATE (LSPosed inactive)"}"
             )
 
             Spacer(modifier = Modifier.height(12.dp))
+        }
+    }
+}
+
+@Composable
+private fun LogCollectorCard(
+    logs: List<String>,
+    isCollecting: Boolean,
+    useRootLogs: Boolean,
+    onToggleUseRootLogs: (Boolean) -> Unit,
+    onRefreshLogs: () -> Unit,
+    onClearLogs: () -> Unit,
+    onCopyLogs: () -> Unit
+) {
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("log_collector_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Terminal,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Column {
+                        Text(
+                            text = "In-App Diagnostic Log Collector",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Async collector (never blocks camera/audio hooks)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                if (isCollecting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                    Text(
+                        text = "Include Root (su) Vector / LSPosed Logcat",
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Text(
+                        text = "Optional: pulls recent VirtualCam & VectorLegacyBridge lines via su with a 3.5s timeout",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = useRootLogs,
+                    onCheckedChange = onToggleUseRootLogs,
+                    modifier = Modifier.testTag("root_logs_switch")
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                FilledTonalButton(
+                    onClick = onRefreshLogs,
+                    enabled = !isCollecting,
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("refresh_logs_button"),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.size(6.dp))
+                    Text("Refresh")
+                }
+
+                OutlinedButton(
+                    onClick = onCopyLogs,
+                    enabled = logs.isNotEmpty(),
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("copy_logs_button"),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ContentCopy,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.size(6.dp))
+                    Text("Copy")
+                }
+
+                TextButton(
+                    onClick = onClearLogs,
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("clear_logs_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DeleteOutline,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.size(4.dp))
+                    Text("Clear", color = MaterialTheme.colorScheme.error)
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 120.dp, max = 240.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color(0xFF070B12))
+                    .padding(10.dp)
+                    .verticalScroll(rememberScrollState())
+                    .horizontalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = if (logs.isEmpty()) "(No logs collected yet)" else logs.joinToString("\n"),
+                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                    color = Color(0xFFCBD5E1)
+                )
+            }
         }
     }
 }

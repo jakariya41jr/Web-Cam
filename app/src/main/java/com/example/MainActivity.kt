@@ -345,12 +345,22 @@ private fun VirtualCamAppShell(
                         VirtualCamTab.SCOPES -> ScopesScreen(
                             config = uiState.config,
                             onToggleAllowAllScoped = viewModel::setAllowAllScopedApps,
+                            onToggleAutoApplyPresets = viewModel::setAutoApplyPresets,
                             onToggleTargetApp = viewModel::toggleTargetApp,
+                            onSavePreset = viewModel::saveCurrentAsPreset,
+                            onApplyPreset = viewModel::applyPreset,
+                            onDeletePreset = viewModel::deletePreset,
                             onAddCustomPackage = viewModel::addCustomTargetApp,
                             onRemoveCustomPackage = viewModel::removeCustomTargetApp
                         )
 
-                        VirtualCamTab.NOTES -> NotesScreen(config = uiState.config)
+                        VirtualCamTab.NOTES -> NotesScreen(
+                            state = uiState,
+                            onToggleUseRootLogs = viewModel::setUseRootLogs,
+                            onRefreshLogs = { viewModel.refreshLogs() },
+                            onClearLogs = viewModel::clearLogs,
+                            onLogsCopied = { viewModel.showFeedback("Copied diagnostic logs to clipboard") }
+                        )
                     }
                 }
             }

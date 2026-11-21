@@ -30,6 +30,7 @@ import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.R
 import com.example.data.VirtualCamRepository
+import com.example.diagnostics.LogCollector
 import com.example.model.VirtualCamConfig
 import com.example.model.VirtualCamConstants
 import kotlin.math.abs
@@ -346,6 +347,10 @@ class FloatingControlService : Service() {
             current.copy(forceBypass = !current.forceBypass)
         }
         repository.saveConfig(updated)
+        LogCollector.recordEvent(
+            "Overlay",
+            if (updated.isEffectivelyArmed) "Switched to VIRTUAL feed" else "Switched to ORIGINAL / BYPASS"
+        )
         refreshOverlayUi(updated)
     }
 
@@ -353,6 +358,7 @@ class FloatingControlService : Service() {
         val current = repository.loadConfig()
         val updated = current.copy(audioEnabled = !current.audioEnabled)
         repository.saveConfig(updated)
+        LogCollector.recordEvent("Overlay", "Video Sound -> ${if (updated.audioEnabled) "ON" else "OFF"}")
         refreshOverlayUi(updated)
     }
 
@@ -360,6 +366,7 @@ class FloatingControlService : Service() {
         val current = repository.loadConfig()
         val updated = current.copy(micEnabled = !current.micEnabled)
         repository.saveConfig(updated)
+        LogCollector.recordEvent("Overlay", "Main Mic -> ${if (updated.micEnabled) "ON" else "MUTED"}")
         refreshOverlayUi(updated)
     }
 
@@ -387,29 +394,31 @@ class FloatingControlService : Service() {
             setColor(dotColor)
         }
 
+        val audioFlag = if (config.audioEnabled) "VA" else "va"
+        val micFlag = if (config.micEnabled) "MIC" else "mute"
         pillLabel.text = when {
-            armed -> "VCAM ON"
+            armed -> "VIRTUAL • $audioFlag/$micFlag"
             config.enabled && !config.selectedMedia.hasMedia -> "NO MEDIA"
-            else -> "REAL CAM"
+            else -> "BYPASS • $micFlag"
         }
 
         styleChip(
             btnCameraMode,
-            label = if (armed) "Cam: VIRTUAL" else "Cam: REAL (Bypass)",
+            label = if (armed) "Cam: VIRTUAL (Tap to Bypass)" else "Cam: ORIGINAL / BYPASS",
             active = armed,
             activeHex = "#064E3B",
             inactiveHex = "#78350F"
         )
         styleChip(
             btnVideoAudio,
-            label = if (config.audioEnabled) "Vid Sound: ON" else "Vid Sound: OFF",
+            label = if (config.audioEnabled) "Video Audio: ON" else "Video Audio: OFF",
             active = config.audioEnabled,
             activeHex = "#0C4A6E",
             inactiveHex = "#1E293B"
         )
         styleChip(
             btnMainMic,
-            label = if (config.micEnabled) "Device Mic: ON" else "Device Mic: MUTED",
+            label = if (config.micEnabled) "Main Mic: ON" else "Main Mic: MUTED",
             active = config.micEnabled,
             activeHex = "#064E3B",
             inactiveHex = "#7F1D1D"

@@ -5,10 +5,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.BitmapFactory
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
+import com.example.model.AppPreset
 import com.example.model.MediaKind
 import com.example.model.SelectedMediaInfo
 import com.example.model.TargetAppScope
@@ -27,10 +31,6 @@ class VirtualCamRepository(private val context: Context) {
             if (!exists()) mkdirs()
         }
 
-    /**
-     * Opens SharedPreferences with Context.MODE_WORLD_READABLE when LSPosed (API 93+)
-     * hooks ContextImpl.checkMode, and gracefully falls back to MODE_PRIVATE otherwise.
-     */
     @Suppress("DEPRECATION")
     @SuppressLint("WorldReadableFiles")
     private fun openPreferences(): Pair<SharedPreferences, Boolean> {
@@ -67,6 +67,12 @@ class VirtualCamRepository(private val context: Context) {
                 height = prefs.getInt(VirtualCamConstants.KEY_MEDIA_HEIGHT, 0),
                 durationMs = prefs.getLong(VirtualCamConstants.KEY_MEDIA_DURATION, 0L),
                 sizeBytes = prefs.getLong(VirtualCamConstants.KEY_MEDIA_SIZE, 0L),
+                fps = prefs.getFloat(VirtualCamConstants.KEY_MEDIA_FPS, 0f),
+                videoCodec = prefs.getString(VirtualCamConstants.KEY_MEDIA_VIDEO_CODEC, "").orEmpty(),
+                audioCodec = prefs.getString(VirtualCamConstants.KEY_MEDIA_AUDIO_CODEC, "").orEmpty(),
+                hasAudioTrack = prefs.getBoolean(VirtualCamConstants.KEY_MEDIA_HAS_AUDIO, false),
+                audioSampleRate = prefs.getInt(VirtualCamConstants.KEY_MEDIA_AUDIO_RATE, 0),
+                videoRotationDegrees = prefs.getInt(VirtualCamConstants.KEY_MEDIA_ROTATION, 0),
                 updatedAtMs = prefs.getLong(VirtualCamConstants.KEY_MEDIA_UPDATED_AT, 0L)
             )
         } else {
@@ -105,6 +111,10 @@ class VirtualCamRepository(private val context: Context) {
                 )
             }
 
+        val presets = decodeAppPresets(
+            prefs.getStringSet(VirtualCamConstants.KEY_APP_PRESETS_SET, emptySet()).orEmpty()
+        )
+
         return VirtualCamConfig(
             enabled = prefs.getBoolean(VirtualCamConstants.KEY_ENABLED, false),
             forceBypass = prefs.getBoolean(VirtualCamConstants.KEY_FORCE_BYPASS, false),
@@ -114,9 +124,11 @@ class VirtualCamRepository(private val context: Context) {
             mirrorHorizontal = prefs.getBoolean(VirtualCamConstants.KEY_MIRROR_HORIZONTAL, false),
             rotationDegrees = prefs.getInt(VirtualCamConstants.KEY_ROTATION_DEGREES, 0),
             allowAllScopedApps = prefs.getBoolean(VirtualCamConstants.KEY_ALLOW_ALL_SCOPED, true),
+            autoApplyPresets = prefs.getBoolean(VirtualCamConstants.KEY_AUTO_APPLY_PRESETS, true),
             overlayRunning = prefs.getBoolean(VirtualCamConstants.KEY_OVERLAY_RUNNING, false),
             selectedMedia = selectedMedia,
             targetApps = builtInTargets + customTargets,
+            appPresets = presets,
             worldReadableActive = worldReadable,
             lsposedActive = ModuleStatus.isModuleActive(),
             xposedApiVersion = ModuleStatus.getXposedApiVersion()
@@ -127,6 +139,7 @@ class VirtualCamRepository(private val context: Context) {
         val (prefs, worldReadable) = openPreferences()
         val enabledSet = config.targetApps.filter { it.isEnabled }.map { it.packageName }.toSet()
         val customSet = config.targetApps.filter { !it.isBuiltIn }.map { it.packageName }.toSet()
+        val presetSet = encodeAppPresets(config.appPresets)
 
         prefs.edit().apply {
             putBoolean(VirtualCamConstants.KEY_ENABLED, config.enabled)
@@ -137,6 +150,7 @@ class VirtualCamRepository(private val context: Context) {
             putBoolean(VirtualCamConstants.KEY_MIRROR_HORIZONTAL, config.mirrorHorizontal)
             putInt(VirtualCamConstants.KEY_ROTATION_DEGREES, config.rotationDegrees)
             putBoolean(VirtualCamConstants.KEY_ALLOW_ALL_SCOPED, config.allowAllScopedApps)
+            putBoolean(VirtualCamConstants.KEY_AUTO_APPLY_PRESETS, config.autoApplyPresets)
             putBoolean(VirtualCamConstants.KEY_OVERLAY_RUNNING, config.overlayRunning)
 
             putString(VirtualCamConstants.KEY_MEDIA_KIND, config.selectedMedia.kind.wireValue)
@@ -148,14 +162,20 @@ class VirtualCamRepository(private val context: Context) {
             putInt(VirtualCamConstants.KEY_MEDIA_HEIGHT, config.selectedMedia.height)
             putLong(VirtualCamConstants.KEY_MEDIA_DURATION, config.selectedMedia.durationMs)
             putLong(VirtualCamConstants.KEY_MEDIA_SIZE, config.selectedMedia.sizeBytes)
+            putFloat(VirtualCamConstants.KEY_MEDIA_FPS, config.selectedMedia.fps)
+            putString(VirtualCamConstants.KEY_MEDIA_VIDEO_CODEC, config.selectedMedia.videoCodec)
+            putString(VirtualCamConstants.KEY_MEDIA_AUDIO_CODEC, config.selectedMedia.audioCodec)
+            putBoolean(VirtualCamConstants.KEY_MEDIA_HAS_AUDIO, config.selectedMedia.hasAudioTrack)
+            putInt(VirtualCamConstants.KEY_MEDIA_AUDIO_RATE, config.selectedMedia.audioSampleRate)
+            putInt(VirtualCamConstants.KEY_MEDIA_ROTATION, config.selectedMedia.videoRotationDegrees)
             putLong(VirtualCamConstants.KEY_MEDIA_UPDATED_AT, config.selectedMedia.updatedAtMs)
 
             putStringSet(VirtualCamConstants.KEY_ENABLED_PACKAGES, enabledSet)
             putStringSet(VirtualCamConstants.KEY_CUSTOM_PACKAGES, customSet)
+            putStringSet(VirtualCamConstants.KEY_APP_PRESETS_SET, presetSet)
             commit()
         }
 
-        // Notify ContentResolver observers & local in-app components (FloatingControlService / MainActivity)
         runCatching {
             context.contentResolver.notifyChange(Uri.parse(VirtualCamConstants.ACTIVE_CONFIG_URI), null)
         }
@@ -238,6 +258,12 @@ class VirtualCamRepository(private val context: Context) {
                 var width = 0
                 var height = 0
                 var durationMs = 0L
+                var fps = 0f
+                var videoCodec = ""
+                var audioCodec = ""
+                var hasAudioTrack = false
+                var audioSampleRate = 0
+                var videoRotation = 0
 
                 if (detectedKind == MediaKind.VIDEO) {
                     val retriever = MediaMetadataRetriever()
@@ -246,8 +272,45 @@ class VirtualCamRepository(private val context: Context) {
                         width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
                         height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
                         durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                        videoRotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                        hasAudioTrack = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO)?.equals("yes", true) == true
+                        fps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull() ?: 0f
+                        if (fps <= 0f && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && durationMs > 0L) {
+                            val frameCount = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)?.toLongOrNull() ?: 0L
+                            if (frameCount > 0L) {
+                                fps = (frameCount * 1000f) / durationMs.toFloat()
+                            }
+                        }
                     } finally {
                         runCatching { retriever.release() }
+                    }
+
+                    val extractor = MediaExtractor()
+                    try {
+                        extractor.setDataSource(destFile.absolutePath)
+                        for (i in 0 until extractor.trackCount) {
+                            val fmt = extractor.getTrackFormat(i)
+                            val trackMime = fmt.getString(MediaFormat.KEY_MIME).orEmpty()
+                            if (trackMime.startsWith("video/") && videoCodec.isBlank()) {
+                                videoCodec = trackMime
+                                if (fps <= 0f && fmt.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                                    fps = runCatching { fmt.getInteger(MediaFormat.KEY_FRAME_RATE).toFloat() }
+                                        .getOrElse {
+                                            runCatching { fmt.getFloat(MediaFormat.KEY_FRAME_RATE) }.getOrDefault(0f)
+                                        }
+                                }
+                            } else if (trackMime.startsWith("audio/") && !hasAudioTrack || trackMime.startsWith("audio/") && audioCodec.isBlank()) {
+                                hasAudioTrack = true
+                                audioCodec = trackMime
+                                if (fmt.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                                    audioSampleRate = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                                }
+                            }
+                        }
+                    } catch (_: Throwable) {
+                        // Best-effort MediaExtractor inspection
+                    } finally {
+                        runCatching { extractor.release() }
                     }
                 } else {
                     val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -270,6 +333,12 @@ class VirtualCamRepository(private val context: Context) {
                     height = height,
                     durationMs = durationMs,
                     sizeBytes = actualSize,
+                    fps = fps,
+                    videoCodec = videoCodec,
+                    audioCodec = audioCodec,
+                    hasAudioTrack = hasAudioTrack,
+                    audioSampleRate = audioSampleRate,
+                    videoRotationDegrees = videoRotation,
                     updatedAtMs = System.currentTimeMillis()
                 )
             }
@@ -280,6 +349,34 @@ class VirtualCamRepository(private val context: Context) {
             if (file.name.startsWith("active_media.")) {
                 file.delete()
             }
+        }
+    }
+
+    companion object {
+        fun encodeAppPresets(presets: Map<String, AppPreset>): Set<String> {
+            return presets.values.map { p ->
+                "${p.packageName}|${if (p.virtualModeEnabled) 1 else 0}|${if (p.audioEnabled) 1 else 0}|${if (p.micEnabled) 1 else 0}|${if (p.loopVideo) 1 else 0}|${if (p.mirrorHorizontal) 1 else 0}|${p.rotationDegrees}"
+            }.toSet()
+        }
+
+        fun decodeAppPresets(entries: Set<String>): Map<String, AppPreset> {
+            val map = linkedMapOf<String, AppPreset>()
+            for (raw in entries) {
+                val parts = raw.split('|')
+                if (parts.size < 7) continue
+                val pkg = parts[0].trim()
+                if (pkg.isBlank()) continue
+                map[pkg] = AppPreset(
+                    packageName = pkg,
+                    virtualModeEnabled = parts[1] == "1",
+                    audioEnabled = parts[2] == "1",
+                    micEnabled = parts[3] == "1",
+                    loopVideo = parts[4] == "1",
+                    mirrorHorizontal = parts[5] == "1",
+                    rotationDegrees = parts[6].toIntOrNull() ?: 0
+                )
+            }
+            return map
         }
     }
 }

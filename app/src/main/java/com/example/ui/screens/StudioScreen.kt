@@ -34,6 +34,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Cameraswitch
+import androidx.compose.material.icons.filled.CheckCircleOutline
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Flip
 import androidx.compose.material.icons.filled.FolderOpen
@@ -132,6 +133,7 @@ fun StudioScreen(
         ) {
             HookStatusBanner(
                 config = config,
+                canDrawOverlays = state.canDrawOverlays,
                 onToggleEnabled = onToggleEnabled,
                 onToggleQuickBypass = onToggleQuickBypass
             )
@@ -142,6 +144,10 @@ fun StudioScreen(
                 isPreviewPlaying = state.isPreviewPlaying,
                 onTogglePreviewPlaying = onTogglePreviewPlaying
             )
+
+            if (config.selectedMedia.hasMedia && config.selectedMedia.kind == MediaKind.VIDEO) {
+                VideoPreCheckCard(config = config)
+            }
 
             MediaPickerDeck(
                 hasMedia = config.selectedMedia.hasMedia,
@@ -173,9 +179,11 @@ fun StudioScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun HookStatusBanner(
     config: VirtualCamConfig,
+    canDrawOverlays: Boolean,
     onToggleEnabled: (Boolean) -> Unit,
     onToggleQuickBypass: () -> Unit
 ) {
@@ -190,14 +198,14 @@ private fun HookStatusBanner(
     )
 
     val statusTitle = when {
-        config.forceBypass -> "BYPASS ACTIVE (REAL CAMERA)"
-        config.isEffectivelyArmed -> "FEED ARMED"
+        config.forceBypass -> "BYPASS ACTIVE (ORIGINAL CAMERA)"
+        config.isEffectivelyArmed -> "VIRTUAL FEED ARMED"
         config.enabled -> "AWAITING MEDIA"
         else -> "INJECTION STANDBY"
     }
 
     val statusSubtitle = when {
-        config.forceBypass -> "Passing real hardware camera frames"
+        config.forceBypass -> "Passing real hardware camera frames cleanly"
         config.isEffectivelyArmed -> "Injecting ${config.selectedMedia.kind.wireValue} into Camera1 / Camera2 / ImageReader"
         config.enabled -> "Select a video or photo below to activate stream"
         else -> "Toggle Virtual Camera on to intercept scoped apps"
@@ -258,6 +266,30 @@ private fun HookStatusBanner(
                 )
             }
 
+            // Live Status Indicator Strip
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.testTag("live_status_strip")
+            ) {
+                TelemetryPill(
+                    label = if (config.isEffectivelyArmed) "MODE: VIRTUAL" else "MODE: BYPASS"
+                )
+                TelemetryPill(
+                    label = when {
+                        config.overlayRunning -> "OVERLAY: ACTIVE"
+                        canDrawOverlays -> "OVERLAY: READY"
+                        else -> "OVERLAY: NO PERMISSION"
+                    }
+                )
+                TelemetryPill(
+                    label = if (config.audioEnabled) "VID SOUND: ON" else "VID SOUND: OFF"
+                )
+                TelemetryPill(
+                    label = if (config.micEnabled) "MAIN MIC: ON" else "MAIN MIC: MUTED"
+                )
+            }
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -306,6 +338,110 @@ private fun HookStatusBanner(
                         text = if (config.forceBypass) "Resume" else stringResource(R.string.action_quick_bypass),
                         style = MaterialTheme.typography.labelLarge
                     )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun VideoPreCheckCard(config: VirtualCamConfig) {
+    val media = config.selectedMedia
+    val warnings = remember(media) { media.buildPreCheckWarnings() }
+
+    Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("video_precheck_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = if (warnings.isEmpty()) {
+                        Icons.Default.CheckCircleOutline
+                    } else {
+                        Icons.Default.WarningAmber
+                    },
+                    contentDescription = null,
+                    tint = if (warnings.isEmpty()) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.tertiary
+                    }
+                )
+                Text(
+                    text = "Video Stream Pre-Check",
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (media.fps > 0f) {
+                    TelemetryPill(label = String.format(Locale.US, "%.0f FPS", media.fps))
+                }
+                if (media.videoCodec.isNotBlank()) {
+                    TelemetryPill(label = media.videoCodec.uppercase(Locale.US))
+                }
+                TelemetryPill(
+                    label = if (media.hasAudioTrack) {
+                        val rate = if (media.audioSampleRate > 0) " ${media.audioSampleRate / 1000}kHz" else ""
+                        "AUDIO TRACK$rate"
+                    } else {
+                        "NO AUDIO TRACK"
+                    }
+                )
+                if (media.videoRotationDegrees != 0) {
+                    TelemetryPill(label = "META ROT ${media.videoRotationDegrees}°")
+                }
+            }
+
+            if (warnings.isEmpty()) {
+                Text(
+                    text = "Optimal H.264/MP4 parameters detected for imo, WhatsApp, and OmeTV WebRTC pipelines.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            } else {
+                warnings.forEach { warning ->
+                    val accent = if (warning.isSevere) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.tertiary
+                    }
+                    Surface(
+                        color = accent.copy(alpha = 0.12f),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = warning.title,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = accent,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = warning.detail,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
                 }
             }
         }

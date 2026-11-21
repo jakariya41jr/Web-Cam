@@ -8,6 +8,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.media.Image
 import android.media.ImageReader
 import android.media.MediaRecorder
 import android.os.Build
@@ -18,21 +19,16 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executor
 
 /**
- * Hooks Camera2 (CameraManager, CameraDeviceImpl, SessionConfiguration, CaptureRequest.Builder),
- * MediaRecorder, and ImageReader pipelines.
- *
- * Key stability fixes:
- * - Replaces OutputConfiguration / SessionConfiguration (API 28+) consistently with a per-device
- *   bridge surface so CaptureRequest.Builder.addTarget(...) never mismatches the session outputs
- *   (fixes Imo crash ~1s after opening camera).
- * - Uses a draining SurfaceTexture or bridge YUV_420_888 ImageReader so hardware BufferQueue
- *   never stalls AND allows instant mid-call switching between Virtual Camera and Real Camera.
+ * Hooks Camera2 (CameraManager, CameraDeviceImpl, CameraCaptureSessionImpl, SessionConfiguration,
+ * CaptureRequest.Builder), MediaRecorder, and ImageReader (including direct-ByteBuffer SurfacePlane
+ * injection fallback when ImageWriter cannot connect to a native window).
  */
 object Camera2Hooks {
     private const val TAG = "[VirtualCam-Cam2]"
@@ -145,14 +141,18 @@ object Camera2Hooks {
     private val deviceSessions = WeakHashMap<Any, DeviceBridgeSession>()
     private val builderToDevice = WeakHashMap<Any, Any>()
     private val mediaRecorderSurfaces = Collections.newSetFromMap(WeakHashMap<Surface, Boolean>())
+    private val readerToSurface = Collections.synchronizedMap(WeakHashMap<ImageReader, Surface>())
+    private val replacedPlaneBuffers = Collections.synchronizedMap(WeakHashMap<Any, ByteBuffer>())
+    private val imageOwnedPlanes = Collections.synchronizedMap(WeakHashMap<Image, List<Any>>())
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         val pkg = lpparam.packageName
         val processName = lpparam.processName ?: pkg
-        hookImageReader(lpparam)
+        hookImageReader(lpparam, pkg, processName)
         hookMediaRecorder(lpparam, pkg, processName)
         hookCameraManager(lpparam, pkg, processName)
         hookCameraDevice(lpparam, pkg, processName)
+        hookCaptureSession(lpparam, pkg, processName)
         hookCaptureRequestBuilder(lpparam, pkg, processName)
         XposedBridge.log("$TAG Installed Camera2 / Surface / MediaRecorder / ImageReader hooks for $pkg (process=$processName)")
     }
@@ -161,6 +161,21 @@ object Camera2Hooks {
         synchronized(deviceSessions) {
             return deviceSessions.getOrPut(device) { DeviceBridgeSession(pkg, processName) }
         }
+    }
+
+    private fun extractOutputSurfaces(configs: List<OutputConfiguration>): List<Surface> {
+        val out = ArrayList<Surface>(configs.size)
+        for (cfg in configs) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val multi = runCatching { cfg.surfaces }.getOrNull()
+                if (!multi.isNullOrEmpty()) {
+                    out.addAll(multi.filterNotNull())
+                    continue
+                }
+            }
+            cfg.surface?.let { out.add(it) }
+        }
+        return out.distinct()
     }
 
     private fun hookCameraManager(lpparam: XC_LoadPackage.LoadPackageParam, pkg: String, processName: String) {
@@ -305,7 +320,7 @@ object Camera2Hooks {
 
                             @Suppress("UNCHECKED_CAST")
                             val configs = (param.args[0] as? List<OutputConfiguration>).orEmpty()
-                            val surfaces = configs.mapNotNull { it.surface }
+                            val surfaces = extractOutputSurfaces(configs)
                             if (surfaces.isEmpty()) return
 
                             val session = getOrCreateDeviceSession(device, pkg, processName)
@@ -336,7 +351,7 @@ object Camera2Hooks {
                             if (!state.isActiveForPackage(pkg, processName)) return
 
                             val origConfig = param.args.firstOrNull() as? SessionConfiguration ?: return
-                            val surfaces = origConfig.outputConfigurations.mapNotNull { it.surface }
+                            val surfaces = extractOutputSurfaces(origConfig.outputConfigurations)
                             if (surfaces.isEmpty()) return
 
                             val session = getOrCreateDeviceSession(device, pkg, processName)
@@ -375,6 +390,52 @@ object Camera2Hooks {
                         val device = param.thisObject ?: return
                         synchronized(deviceSessions) {
                             deviceSessions.remove(device)?.release()
+                        }
+                    }
+                }
+            )
+        }
+    }
+
+    private fun hookCaptureSession(lpparam: XC_LoadPackage.LoadPackageParam, pkg: String, processName: String) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        val sessionImplClass = runCatching {
+            XposedHelpers.findClass("android.hardware.camera2.impl.CameraCaptureSessionImpl", lpparam.classLoader)
+        }.getOrNull() ?: return
+
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                sessionImplClass,
+                "finalizeOutputConfigurations",
+                List::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val state = HookMediaBridge.readRuntimeState(pkg, processName, forceRefresh = true)
+                        if (!state.isActiveForPackage(pkg, processName)) return
+
+                        @Suppress("UNCHECKED_CAST")
+                        val configs = (param.args.firstOrNull() as? List<OutputConfiguration>).orEmpty()
+                        val surfaces = extractOutputSurfaces(configs)
+                        if (surfaces.isEmpty()) return
+
+                        val captureSession = param.thisObject as? CameraCaptureSession
+                        val device = runCatching { captureSession?.device }.getOrNull()
+                        val session = if (device != null) {
+                            getOrCreateDeviceSession(device, pkg, processName)
+                        } else {
+                            null
+                        }
+
+                        surfaces.forEach { surface ->
+                            if (surface.isValid) {
+                                session?.appSurfaces?.add(surface)
+                                HookMediaBridge.startRendererForSurface(
+                                    surface = surface,
+                                    packageName = pkg,
+                                    processName = processName,
+                                    passthroughProvider = session?.let { { it.copyLatestRealFrame() } }
+                                )
+                            }
                         }
                     }
                 }
@@ -547,10 +608,25 @@ object Camera2Hooks {
         }
     }
 
-    private fun hookImageReader(lpparam: XC_LoadPackage.LoadPackageParam) {
+    private fun hookImageReader(
+        lpparam: XC_LoadPackage.LoadPackageParam,
+        pkg: String,
+        processName: String
+    ) {
         val readerClass = runCatching {
             XposedHelpers.findClass("android.media.ImageReader", lpparam.classLoader)
         }.getOrNull() ?: return
+
+        fun registerReader(reader: ImageReader, w: Int, h: Int, fmt: Int, maxImages: Int) {
+            runCatching {
+                val surface = reader.surface
+                readerToSurface[reader] = surface
+                HookMediaBridge.registerImageReaderSurface(
+                    surface,
+                    ReaderSurfaceSpec(w, h, fmt, maxImages)
+                )
+            }
+        }
 
         // Track ImageReader dimensions & format on creation so ImageWriter writes exact matching YUV_420_888 frames
         runCatching {
@@ -568,12 +644,7 @@ object Camera2Hooks {
                         val h = (param.args[1] as? Int) ?: reader.height
                         val fmt = (param.args[2] as? Int) ?: reader.imageFormat
                         val maxImages = (param.args[3] as? Int) ?: reader.maxImages
-                        runCatching {
-                            HookMediaBridge.registerImageReaderSurface(
-                                reader.surface,
-                                ReaderSurfaceSpec(w, h, fmt, maxImages)
-                            )
-                        }
+                        registerReader(reader, w, h, fmt, maxImages)
                     }
                 }
             )
@@ -596,11 +667,98 @@ object Camera2Hooks {
                             val h = (param.args[1] as? Int) ?: reader.height
                             val fmt = (param.args[2] as? Int) ?: reader.imageFormat
                             val maxImages = (param.args[3] as? Int) ?: reader.maxImages
-                            runCatching {
-                                HookMediaBridge.registerImageReaderSurface(
-                                    reader.surface,
-                                    ReaderSurfaceSpec(w, h, fmt, maxImages)
-                                )
+                            registerReader(reader, w, h, fmt, maxImages)
+                        }
+                    }
+                )
+            }
+        }
+
+        // Direct-ByteBuffer plane fallback for acquireLatestImage() / acquireNextImage()
+        // Runs whenever ImageWriter is NOT actively driving the surface (fixes WhatsApp/OmeTV black screen)
+        val acquireCallback = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val reader = param.thisObject as? ImageReader ?: return
+                val image = param.result as? Image ?: return
+                if (image.format != ImageFormat.YUV_420_888) return
+
+                val readerSurface = readerToSurface[reader] ?: runCatching { reader.surface }.getOrNull()
+                if (HookMediaBridge.hasActiveImageWriter(readerSurface)) return
+
+                val state = HookMediaBridge.readRuntimeState(pkg, processName)
+                if (!state.isActiveForPackage(pkg, processName)) return
+
+                val planes = runCatching { image.planes }.getOrNull() ?: return
+                if (planes.size < 3) return
+
+                val yPlane = planes[0]
+                val uPlane = planes[1]
+                val vPlane = planes[2]
+
+                val direct = HookMediaBridge.buildDirectYuvPlanesForImage(
+                    context = HookMediaBridge.currentAppContext(),
+                    state = state,
+                    width = image.width,
+                    height = image.height,
+                    yRowStride = yPlane.rowStride,
+                    yPixStride = yPlane.pixelStride,
+                    uRowStride = uPlane.rowStride,
+                    uPixStride = uPlane.pixelStride,
+                    vRowStride = vPlane.rowStride,
+                    vPixStride = vPlane.pixelStride,
+                    yCap = yPlane.buffer.capacity(),
+                    uCap = uPlane.buffer.capacity(),
+                    vCap = vPlane.buffer.capacity()
+                ) ?: return
+
+                replacedPlaneBuffers[yPlane] = direct.yBuf
+                replacedPlaneBuffers[uPlane] = direct.uBuf
+                replacedPlaneBuffers[vPlane] = direct.vBuf
+                imageOwnedPlanes[image] = listOf(yPlane, uPlane, vPlane)
+            }
+        }
+
+        for (acquireMethod in listOf("acquireLatestImage", "acquireNextImage")) {
+            runCatching {
+                XposedHelpers.findAndHookMethod(readerClass, acquireMethod, acquireCallback)
+            }
+        }
+
+        val surfacePlaneClass = runCatching {
+            XposedHelpers.findClass("android.media.ImageReader\$SurfaceImage\$SurfacePlane", lpparam.classLoader)
+        }.getOrNull() ?: runCatching {
+            XposedHelpers.findClass("android.media.ImageReader\$SurfacePlane", lpparam.classLoader)
+        }.getOrNull()
+
+        if (surfacePlaneClass != null) {
+            runCatching {
+                XposedHelpers.findAndHookMethod(
+                    surfacePlaneClass,
+                    "getBuffer",
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val replacement = replacedPlaneBuffers[param.thisObject] ?: return
+                            param.result = replacement.duplicate()
+                        }
+                    }
+                )
+            }
+        }
+
+        val surfaceImageClass = runCatching {
+            XposedHelpers.findClass("android.media.ImageReader\$SurfaceImage", lpparam.classLoader)
+        }.getOrNull()
+
+        if (surfaceImageClass != null) {
+            runCatching {
+                XposedHelpers.findAndHookMethod(
+                    surfaceImageClass,
+                    "close",
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val img = param.thisObject as? Image ?: return
+                            imageOwnedPlanes.remove(img)?.forEach { plane ->
+                                replacedPlaneBuffers.remove(plane)
                             }
                         }
                     }
@@ -615,7 +773,7 @@ object Camera2Hooks {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val reader = param.thisObject as? ImageReader ?: return
-                        runCatching { reader.surface }.getOrNull()?.let { surface ->
+                        (readerToSurface.remove(reader) ?: runCatching { reader.surface }.getOrNull())?.let { surface ->
                             HookMediaBridge.unregisterImageReaderSurface(surface)
                             HookMediaBridge.stopRendererForSurface(surface)
                         }

@@ -41,6 +41,7 @@ class VirtualCamMediaProvider : ContentProvider() {
         if (uriMatcher.match(uri) != CODE_CONFIG) return null
 
         val config = VirtualCamRepository(ctx).loadConfig()
+        val encodedPresets = VirtualCamRepository.encodeAppPresets(config.appPresets).joinToString(";;")
         val columns = arrayOf(
             VirtualCamConstants.KEY_ENABLED,
             VirtualCamConstants.KEY_FORCE_BYPASS,
@@ -50,6 +51,8 @@ class VirtualCamMediaProvider : ContentProvider() {
             VirtualCamConstants.KEY_MIRROR_HORIZONTAL,
             VirtualCamConstants.KEY_ROTATION_DEGREES,
             VirtualCamConstants.KEY_ALLOW_ALL_SCOPED,
+            VirtualCamConstants.KEY_AUTO_APPLY_PRESETS,
+            VirtualCamConstants.KEY_APP_PRESETS_SET,
             VirtualCamConstants.KEY_MEDIA_KIND,
             VirtualCamConstants.KEY_MEDIA_MIME,
             VirtualCamConstants.KEY_MEDIA_WIDTH,
@@ -69,6 +72,8 @@ class VirtualCamMediaProvider : ContentProvider() {
                     if (config.mirrorHorizontal) 1 else 0,
                     config.rotationDegrees,
                     if (config.allowAllScopedApps) 1 else 0,
+                    if (config.autoApplyPresets) 1 else 0,
+                    encodedPresets,
                     config.selectedMedia.kind.wireValue,
                     config.selectedMedia.mimeType,
                     config.selectedMedia.width,

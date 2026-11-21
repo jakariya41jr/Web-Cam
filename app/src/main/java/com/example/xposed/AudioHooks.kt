@@ -6,6 +6,7 @@ import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.os.Build
 import com.example.model.MediaKind
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -13,13 +14,14 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
 /**
  * Decodes PCM audio from the selected video file into a circular ring buffer
- * and hooks AudioRecord.read(...) so calls can independently:
+ * and hooks AudioRecord.read(...) + startRecording() so calls can independently:
  * 1) Inject video sound into the outgoing call stream (Video Audio toggle)
  * 2) Mute or pass through the device microphone (Main Microphone toggle)
  */
@@ -32,7 +34,8 @@ object AudioHooks {
         val encoding: Int
     )
 
-    private val recordConfigs = WeakHashMap<AudioRecord, RecordConfig>()
+    private val recordConfigs = Collections.synchronizedMap(WeakHashMap<AudioRecord, RecordConfig>())
+    private val loggedRecords = Collections.newSetFromMap(Collections.synchronizedMap(WeakHashMap<AudioRecord, Boolean>()))
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         val pkg = lpparam.packageName
@@ -41,28 +44,69 @@ object AudioHooks {
             XposedHelpers.findClass("android.media.AudioRecord", lpparam.classLoader)
         }.getOrNull() ?: return
 
-        // Track AudioRecord parameters via constructors and startRecording
+        // Track AudioRecord parameters via constructors and Builder.build()
         XposedBridge.hookAllConstructors(audioRecordClass, object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val record = param.thisObject as? AudioRecord ?: return
-                runCatching {
-                    recordConfigs[record] = RecordConfig(
-                        sampleRate = record.sampleRate.coerceAtLeast(8000),
-                        channelCount = record.channelCount.coerceIn(1, 2),
-                        encoding = record.audioFormat
-                    )
-                }
+                captureConfig(record)
             }
         })
 
-        // Hook AudioRecord.read(byte[], int, int) and read(byte[], int, int, int)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            runCatching {
+                val builderClass = XposedHelpers.findClass("android.media.AudioRecord\$Builder", lpparam.classLoader)
+                XposedHelpers.findAndHookMethod(
+                    builderClass,
+                    "build",
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val record = param.result as? AudioRecord ?: return
+                            captureConfig(record)
+                        }
+                    }
+                )
+            }
+        }
+
+        // Pre-warm audio decoder immediately when call starts recording
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                audioRecordClass,
+                "startRecording",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val state = HookMediaBridge.readRuntimeState(pkg, processName, forceRefresh = true)
+                        if (state.isScopedTarget(pkg, processName) &&
+                            state.enabled &&
+                            !state.forceBypass &&
+                            state.audioEnabled &&
+                            state.mediaKind == MediaKind.VIDEO
+                        ) {
+                            VideoAudioRingBuffer.warmUp(HookMediaBridge.currentAppContext(), state)
+                        }
+                    }
+                }
+            )
+        }
+
         hookByteArrayRead(audioRecordClass, pkg, processName)
-        // Hook AudioRecord.read(short[], int, int) and read(short[], int, int, int)
         hookShortArrayRead(audioRecordClass, pkg, processName)
-        // Hook AudioRecord.read(ByteBuffer, int) and read(ByteBuffer, int, int)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            hookFloatArrayRead(audioRecordClass, pkg, processName)
+        }
         hookByteBufferRead(audioRecordClass, pkg, processName)
 
         XposedBridge.log("$TAG Installed AudioRecord call-routing hooks for $pkg (process=$processName)")
+    }
+
+    private fun captureConfig(record: AudioRecord) {
+        runCatching {
+            recordConfigs[record] = RecordConfig(
+                sampleRate = record.sampleRate.coerceAtLeast(8000),
+                channelCount = record.channelCount.coerceIn(1, 2),
+                encoding = record.audioFormat
+            )
+        }
     }
 
     private fun hookByteArrayRead(
@@ -92,6 +136,8 @@ object AudioHooks {
                 val muteMic = !state.micEnabled
 
                 if (!muteMic && !injectVideoAudio) return
+
+                logSessionOnce(record, pkg, cfg, injectVideoAudio, muteMic, "byte[]")
 
                 val sampleCount = bytesRead / 2
                 val tempShorts = ShortArray(sampleCount)
@@ -160,6 +206,8 @@ object AudioHooks {
 
                 if (!muteMic && !injectVideoAudio) return
 
+                logSessionOnce(record, pkg, cfg, injectVideoAudio, muteMic, "short[]")
+
                 val slice = ShortArray(shortsRead)
                 System.arraycopy(buffer, offset, slice, 0, shortsRead)
                 processPcm16Samples(
@@ -192,6 +240,69 @@ object AudioHooks {
         }
     }
 
+    private fun hookFloatArrayRead(
+        audioRecordClass: Class<*>,
+        pkg: String,
+        processName: String
+    ) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                audioRecordClass,
+                "read",
+                FloatArray::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val record = param.thisObject as? AudioRecord ?: return
+                        val floatsRead = (param.result as? Int) ?: return
+                        if (floatsRead <= 0) return
+
+                        val buffer = param.args[0] as? FloatArray ?: return
+                        val offset = (param.args[1] as? Int) ?: 0
+                        if (offset < 0 || offset + floatsRead > buffer.size) return
+
+                        val state = HookMediaBridge.readRuntimeState(pkg, processName)
+                        if (!state.isScopedTarget(pkg, processName) || !state.enabled) return
+
+                        val cfg = getRecordConfig(record)
+                        val injectVideoAudio = !state.forceBypass &&
+                            state.audioEnabled &&
+                            state.mediaKind == MediaKind.VIDEO
+                        val muteMic = !state.micEnabled
+
+                        if (!muteMic && !injectVideoAudio) return
+
+                        logSessionOnce(record, pkg, cfg, injectVideoAudio, muteMic, "float[]")
+
+                        val tempShorts = ShortArray(floatsRead)
+                        if (!muteMic) {
+                            for (i in 0 until floatsRead) {
+                                val clamped = buffer[offset + i].coerceIn(-1f, 1f)
+                                tempShorts[i] = (clamped * 32767f).toInt().toShort()
+                            }
+                        }
+                        if (injectVideoAudio) {
+                            VideoAudioRingBuffer.mixInto(
+                                context = HookMediaBridge.currentAppContext(),
+                                state = state,
+                                dstSamples = tempShorts,
+                                dstCount = floatsRead,
+                                dstRate = cfg.sampleRate,
+                                dstChannels = cfg.channelCount,
+                                micMuted = muteMic
+                            )
+                        }
+                        for (i in 0 until floatsRead) {
+                            buffer[offset + i] = tempShorts[i].toFloat() / 32768f
+                        }
+                    }
+                }
+            )
+        }
+    }
+
     private fun hookByteBufferRead(
         audioRecordClass: Class<*>,
         pkg: String,
@@ -208,8 +319,6 @@ object AudioHooks {
                 if (!state.isScopedTarget(pkg, processName) || !state.enabled) return
 
                 val cfg = getRecordConfig(record)
-                if (cfg.encoding != AudioFormat.ENCODING_PCM_16BIT) return
-
                 val injectVideoAudio = !state.forceBypass &&
                     state.audioEnabled &&
                     state.mediaKind == MediaKind.VIDEO
@@ -218,9 +327,46 @@ object AudioHooks {
                 if (!muteMic && !injectVideoAudio) return
 
                 val dup = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN)
-                // AudioRecord advances position or fills from 0 depending on direct/heap buffer
-                val startPos = if (dup.position() >= bytesRead) dup.position() - bytesRead else 0
+                // Android AudioRecord.read(ByteBuffer, size) writes at buf.position() without advancing position
+                val startPos = dup.position().coerceAtLeast(0)
                 if (startPos + bytesRead > dup.capacity()) return
+
+                if (cfg.encoding == AudioFormat.ENCODING_PCM_FLOAT) {
+                    val floatCount = bytesRead / 4
+                    if (floatCount <= 0) return
+                    logSessionOnce(record, pkg, cfg, injectVideoAudio, muteMic, "ByteBuffer-Float")
+                    val floats = FloatArray(floatCount)
+                    dup.position(startPos)
+                    dup.asFloatBuffer().get(floats)
+
+                    val tempShorts = ShortArray(floatCount)
+                    if (!muteMic) {
+                        for (i in 0 until floatCount) {
+                            tempShorts[i] = (floats[i].coerceIn(-1f, 1f) * 32767f).toInt().toShort()
+                        }
+                    }
+                    if (injectVideoAudio) {
+                        VideoAudioRingBuffer.mixInto(
+                            context = HookMediaBridge.currentAppContext(),
+                            state = state,
+                            dstSamples = tempShorts,
+                            dstCount = floatCount,
+                            dstRate = cfg.sampleRate,
+                            dstChannels = cfg.channelCount,
+                            micMuted = muteMic
+                        )
+                    }
+                    for (i in 0 until floatCount) {
+                        floats[i] = tempShorts[i].toFloat() / 32768f
+                    }
+                    dup.position(startPos)
+                    dup.asFloatBuffer().put(floats)
+                    return
+                }
+
+                if (cfg.encoding != AudioFormat.ENCODING_PCM_16BIT) return
+
+                logSessionOnce(record, pkg, cfg, injectVideoAudio, muteMic, "ByteBuffer-PCM16")
 
                 val sampleCount = bytesRead / 2
                 val samples = ShortArray(sampleCount)
@@ -258,6 +404,23 @@ object AudioHooks {
         }
     }
 
+    private fun logSessionOnce(
+        record: AudioRecord,
+        pkg: String,
+        cfg: RecordConfig,
+        injectVideoAudio: Boolean,
+        muteMic: Boolean,
+        methodKind: String
+    ) {
+        if (loggedRecords.add(record)) {
+            XposedBridge.log(
+                "$TAG Routing $pkg ($methodKind): rate=${cfg.sampleRate}Hz ch=${cfg.channelCount} " +
+                    "fmt=${cfg.encoding} videoSound=$injectVideoAudio micMuted=$muteMic " +
+                    "ringAvail=${VideoAudioRingBuffer.availableSamples()}"
+            )
+        }
+    }
+
     private fun getRecordConfig(record: AudioRecord): RecordConfig {
         return recordConfigs[record] ?: runCatching {
             RecordConfig(
@@ -289,7 +452,8 @@ object AudioHooks {
                 dstSamples = samples,
                 dstCount = count,
                 dstRate = dstRate,
-                dstChannels = dstChannels
+                dstChannels = dstChannels,
+                micMuted = muteMic
             )
         }
     }
@@ -324,13 +488,23 @@ private object VideoAudioRingBuffer {
 
     private var resamplePhase = 0.0
 
+    fun availableSamples(): Int = synchronized(lock) { available }
+
+    fun warmUp(context: Context?, state: HookRuntimeState) {
+        val sig = "${state.mediaPath}:${state.mediaUpdatedAtMs}"
+        if (sig != mediaSignature || !running.get()) {
+            startDecoder(context, state, sig)
+        }
+    }
+
     fun mixInto(
         context: Context?,
         state: HookRuntimeState,
         dstSamples: ShortArray,
         dstCount: Int,
         dstRate: Int,
-        dstChannels: Int
+        dstChannels: Int,
+        micMuted: Boolean
     ) {
         val sig = "${state.mediaPath}:${state.mediaUpdatedAtMs}"
         if (sig != mediaSignature || !running.get()) {
@@ -339,6 +513,9 @@ private object VideoAudioRingBuffer {
 
         val framesNeeded = dstCount / dstChannels.coerceAtLeast(1)
         if (framesNeeded <= 0) return
+
+        val micGain = if (micMuted) 0f else 0.65f
+        val videoGain = if (micMuted) 0.95f else 0.85f
 
         synchronized(lock) {
             if (available < srcChannels) return
@@ -349,19 +526,18 @@ private object VideoAudioRingBuffer {
             for (f in 0 until framesNeeded) {
                 if (available < srcChannels) break
 
-                // Read current source frame
                 val left = ring[readPos]
                 val right = if (srcChannels >= 2) ring[(readPos + 1) % CAPACITY] else left
-                val mono = ((left.toInt() + right.toInt()) / 2).toShort()
+                val mono = ((left.toInt() + right.toInt()) / 2)
 
                 if (dstChannels == 1) {
-                    val mixed = dstSamples[dstIdx].toInt() + mono.toInt()
+                    val mixed = (dstSamples[dstIdx] * micGain + mono * videoGain).toInt()
                     dstSamples[dstIdx++] = mixed.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
                 } else {
-                    val mixL = dstSamples[dstIdx].toInt() + left.toInt()
+                    val mixL = (dstSamples[dstIdx] * micGain + left * videoGain).toInt()
                     dstSamples[dstIdx++] = mixL.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
                     if (dstIdx < dstCount) {
-                        val mixR = dstSamples[dstIdx].toInt() + right.toInt()
+                        val mixR = (dstSamples[dstIdx] * micGain + right * videoGain).toInt()
                         dstSamples[dstIdx++] = mixR.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
                     }
                 }
@@ -424,7 +600,6 @@ private object VideoAudioRingBuffer {
                     }
                 }
                 if (audioTrack < 0 || audioFormat == null) {
-                    // Video has no audio track; exit quietly without error spam
                     running.set(false)
                     return
                 }
@@ -444,7 +619,6 @@ private object VideoAudioRingBuffer {
                 var outputDone = false
 
                 while (running.get() && !outputDone) {
-                    // Throttle producer if ring buffer is > 70% full
                     val ringUsage = synchronized(lock) { available }
                     if (ringUsage > (CAPACITY * 7) / 10) {
                         Thread.sleep(25L)
