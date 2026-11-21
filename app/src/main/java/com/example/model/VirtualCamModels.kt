@@ -39,10 +39,12 @@ data class VirtualCamConfig(
     val enabled: Boolean = false,
     val forceBypass: Boolean = false,
     val audioEnabled: Boolean = true,
+    val micEnabled: Boolean = true,
     val loopVideo: Boolean = true,
     val mirrorHorizontal: Boolean = false,
     val rotationDegrees: Int = 0,
     val allowAllScopedApps: Boolean = true,
+    val overlayRunning: Boolean = false,
     val selectedMedia: SelectedMediaInfo = SelectedMediaInfo(),
     val targetApps: List<TargetAppScope> = VirtualCamConstants.defaultTargetApps,
     val worldReadableActive: Boolean = false,
@@ -59,14 +61,17 @@ object VirtualCamConstants {
     const val PROVIDER_AUTHORITY = "$MODULE_PACKAGE.provider"
     const val ACTIVE_MEDIA_URI = "content://$PROVIDER_AUTHORITY/active_media"
     const val ACTIVE_CONFIG_URI = "content://$PROVIDER_AUTHORITY/config"
+    const val ACTION_CONFIG_CHANGED = "$MODULE_PACKAGE.ACTION_CONFIG_CHANGED"
 
     const val KEY_ENABLED = "enabled"
     const val KEY_FORCE_BYPASS = "force_bypass"
     const val KEY_AUDIO_ENABLED = "audio_enabled"
+    const val KEY_MIC_ENABLED = "mic_enabled"
     const val KEY_LOOP_VIDEO = "loop_video"
     const val KEY_MIRROR_HORIZONTAL = "mirror_horizontal"
     const val KEY_ROTATION_DEGREES = "rotation_degrees"
     const val KEY_ALLOW_ALL_SCOPED = "allow_all_scoped_apps"
+    const val KEY_OVERLAY_RUNNING = "overlay_running"
     const val KEY_MEDIA_KIND = "media_kind"
     const val KEY_MEDIA_NAME = "media_name"
     const val KEY_MEDIA_PATH = "media_path"
@@ -82,6 +87,8 @@ object VirtualCamConstants {
 
     val defaultTargetApps = listOf(
         TargetAppScope("com.whatsapp", "WhatsApp", "Messaging", isEnabled = true),
+        TargetAppScope("com.imo.android.imoim", "imo", "Video Call", isEnabled = true),
+        TargetAppScope("omegle.tv", "OmeTV", "Video Chat", isEnabled = true),
         TargetAppScope("com.facebook.orca", "Messenger", "Messaging", isEnabled = true),
         TargetAppScope("com.instagram.android", "Instagram", "Social", isEnabled = true),
         TargetAppScope("org.telegram.messenger", "Telegram", "Messaging", isEnabled = true),

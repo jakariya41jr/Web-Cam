@@ -1,6 +1,15 @@
 package com.example
 
+import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -48,8 +57,11 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.model.MediaKind
+import com.example.model.VirtualCamConstants
+import com.example.overlay.FloatingControlService
 import com.example.ui.VirtualCamViewModel
 import com.example.ui.screens.NotesScreen
 import com.example.ui.screens.ScopesScreen
@@ -110,9 +122,42 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val overlayPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        viewModel.refreshStatus()
+        if (Settings.canDrawOverlays(this)) {
+            startFloatingOverlayWithNotificationCheck()
+        } else {
+            viewModel.showFeedback("Display over other apps permission not granted")
+        }
+    }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        // Start floating overlay regardless; foreground notification shows if granted
+        if (Settings.canDrawOverlays(this)) {
+            FloatingControlService.start(this)
+        }
+    }
+
+    private val configBroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            viewModel.refreshStatus()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        ContextCompat.registerReceiver(
+            this,
+            configBroadcastReceiver,
+            IntentFilter(VirtualCamConstants.ACTION_CONFIG_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
 
         setContent {
             VirtualCamTheme(darkTheme = true) {
@@ -132,15 +177,54 @@ class MainActivity : ComponentActivity() {
                     },
                     onBrowseFiles = {
                         openDocumentLauncher.launch(arrayOf("video/*", "image/*"))
+                    },
+                    onRequestOverlayPermission = {
+                        val intent = Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        )
+                        overlayPermissionLauncher.launch(intent)
+                    },
+                    onToggleFloatingOverlay = { enable ->
+                        if (enable) {
+                            if (Settings.canDrawOverlays(this)) {
+                                startFloatingOverlayWithNotificationCheck()
+                            } else {
+                                val intent = Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:$packageName")
+                                )
+                                overlayPermissionLauncher.launch(intent)
+                            }
+                        } else {
+                            FloatingControlService.stop(this)
+                            viewModel.refreshStatus()
+                        }
                     }
                 )
             }
         }
     }
 
+    private fun startFloatingOverlayWithNotificationCheck() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            FloatingControlService.start(this)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         viewModel.refreshStatus()
+    }
+
+    override fun onDestroy() {
+        runCatching { unregisterReceiver(configBroadcastReceiver) }
+        super.onDestroy()
     }
 }
 
@@ -151,7 +235,9 @@ private fun VirtualCamAppShell(
     feedbackMessage: String?,
     onPickVideo: () -> Unit,
     onPickPhoto: () -> Unit,
-    onBrowseFiles: () -> Unit
+    onBrowseFiles: () -> Unit,
+    onRequestOverlayPermission: () -> Unit,
+    onToggleFloatingOverlay: (Boolean) -> Unit
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     var currentTab by rememberSaveable { mutableStateOf(VirtualCamTab.STUDIO) }
@@ -247,10 +333,13 @@ private fun VirtualCamAppShell(
                             onToggleEnabled = viewModel::setEnabled,
                             onToggleQuickBypass = viewModel::toggleQuickBypass,
                             onToggleAudio = viewModel::setAudioEnabled,
+                            onToggleMic = viewModel::setMicEnabled,
                             onToggleLoop = viewModel::setLoopVideo,
                             onToggleMirror = viewModel::setMirrorHorizontal,
                             onCycleRotation = viewModel::cycleRotation,
-                            onTogglePreviewPlaying = viewModel::togglePreviewPlaying
+                            onTogglePreviewPlaying = viewModel::togglePreviewPlaying,
+                            onRequestOverlayPermission = onRequestOverlayPermission,
+                            onToggleFloatingOverlay = onToggleFloatingOverlay
                         )
 
                         VirtualCamTab.SCOPES -> ScopesScreen(

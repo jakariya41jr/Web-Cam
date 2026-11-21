@@ -45,6 +45,7 @@ class VirtualCamMediaProvider : ContentProvider() {
             VirtualCamConstants.KEY_ENABLED,
             VirtualCamConstants.KEY_FORCE_BYPASS,
             VirtualCamConstants.KEY_AUDIO_ENABLED,
+            VirtualCamConstants.KEY_MIC_ENABLED,
             VirtualCamConstants.KEY_LOOP_VIDEO,
             VirtualCamConstants.KEY_MIRROR_HORIZONTAL,
             VirtualCamConstants.KEY_ROTATION_DEGREES,
@@ -53,7 +54,8 @@ class VirtualCamMediaProvider : ContentProvider() {
             VirtualCamConstants.KEY_MEDIA_MIME,
             VirtualCamConstants.KEY_MEDIA_WIDTH,
             VirtualCamConstants.KEY_MEDIA_HEIGHT,
-            VirtualCamConstants.KEY_MEDIA_PATH
+            VirtualCamConstants.KEY_MEDIA_PATH,
+            VirtualCamConstants.KEY_MEDIA_UPDATED_AT
         )
 
         return MatrixCursor(columns).apply {
@@ -62,6 +64,7 @@ class VirtualCamMediaProvider : ContentProvider() {
                     if (config.enabled) 1 else 0,
                     if (config.forceBypass) 1 else 0,
                     if (config.audioEnabled) 1 else 0,
+                    if (config.micEnabled) 1 else 0,
                     if (config.loopVideo) 1 else 0,
                     if (config.mirrorHorizontal) 1 else 0,
                     config.rotationDegrees,
@@ -70,7 +73,8 @@ class VirtualCamMediaProvider : ContentProvider() {
                     config.selectedMedia.mimeType,
                     config.selectedMedia.width,
                     config.selectedMedia.height,
-                    config.selectedMedia.localFilePath
+                    config.selectedMedia.localFilePath,
+                    config.selectedMedia.updatedAtMs
                 )
             )
         }
@@ -100,7 +104,6 @@ class VirtualCamMediaProvider : ContentProvider() {
             mediaDir.listFiles()?.firstOrNull { it.name.startsWith("active_media.") }?.canonicalFile
         } ?: return null
 
-        // Prevent path traversal outside the app's virtual_cam_media directory
         if (!candidate.path.startsWith(mediaDir.path + File.separator)) {
             return null
         }

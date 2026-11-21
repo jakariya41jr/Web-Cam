@@ -2,6 +2,7 @@ package com.example.ui
 
 import android.app.Application
 import android.net.Uri
+import android.provider.Settings
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.VirtualCamRepository
@@ -17,6 +18,7 @@ import kotlinx.coroutines.launch
 
 data class VirtualCamUiState(
     val config: VirtualCamConfig = VirtualCamConfig(),
+    val canDrawOverlays: Boolean = false,
     val isImporting: Boolean = false,
     val isPreviewPlaying: Boolean = true,
     val feedbackMessage: String? = null
@@ -24,16 +26,26 @@ data class VirtualCamUiState(
 
 class VirtualCamViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val repository = VirtualCamRepository(application.applicationContext)
+    private val appContext = application.applicationContext
+    private val repository = VirtualCamRepository(appContext)
 
     private val _uiState = MutableStateFlow(
-        VirtualCamUiState(config = repository.loadConfig())
+        VirtualCamUiState(
+            config = repository.loadConfig(),
+            canDrawOverlays = Settings.canDrawOverlays(appContext)
+        )
     )
     val uiState: StateFlow<VirtualCamUiState> = _uiState.asStateFlow()
 
     fun refreshStatus() {
         val loaded = repository.loadConfig()
-        _uiState.update { it.copy(config = loaded) }
+        val overlayAllowed = Settings.canDrawOverlays(appContext)
+        _uiState.update {
+            it.copy(
+                config = loaded,
+                canDrawOverlays = overlayAllowed
+            )
+        }
     }
 
     fun importMedia(uri: Uri, hintKind: MediaKind? = null) {
@@ -105,7 +117,7 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
         _uiState.update {
             it.copy(
                 feedbackMessage = if (nextBypass) {
-                    "Bypass active: hardware camera passed through"
+                    "Bypass active: original camera passed through"
                 } else {
                     "Bypass released: virtual feed resumed"
                 }
@@ -115,6 +127,10 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
 
     fun setAudioEnabled(enabled: Boolean) {
         updateConfig { copy(audioEnabled = enabled) }
+    }
+
+    fun setMicEnabled(enabled: Boolean) {
+        updateConfig { copy(micEnabled = enabled) }
     }
 
     fun setLoopVideo(loop: Boolean) {
@@ -186,12 +202,21 @@ class VirtualCamViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun showFeedback(message: String) {
+        _uiState.update { it.copy(feedbackMessage = message) }
+    }
+
     fun dismissFeedback() {
         _uiState.update { it.copy(feedbackMessage = null) }
     }
 
     private fun updateConfig(transform: VirtualCamConfig.() -> VirtualCamConfig) {
         val next = repository.saveConfig(_uiState.value.config.transform())
-        _uiState.update { it.copy(config = next) }
+        _uiState.update {
+            it.copy(
+                config = next,
+                canDrawOverlays = Settings.canDrawOverlays(appContext)
+            )
+        }
     }
 }

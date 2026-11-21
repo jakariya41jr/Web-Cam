@@ -6,12 +6,11 @@ import de.robv.android.xposed.XC_MethodReplacement
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
-
 import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Primary Xposed / LSPosed entry point declared in assets/xposed_init.
- * Intercepts target package loading and installs Camera1 & Camera2/Surface hooks.
+ * Intercepts target package loading and installs Camera1, Camera2/Surface, and AudioRecord hooks.
  */
 class VirtualCamHookEntry : IXposedHookLoadPackage {
 
@@ -29,19 +28,18 @@ class VirtualCamHookEntry : IXposedHookLoadPackage {
             return
         }
 
-        // Skip system/framework processes unless explicitly scoped
+        // Skip core Android framework / SystemUI processes
         if (pkg == "android" || pkg == "com.android.systemui") {
             return
         }
 
-        // Avoid duplicate hook registration if handleLoadPackage fires multiple times for split APKs
-        if (!hookedPackages.add(pkg)) {
+        val hookKey = "$pkg|${lpparam.processName ?: pkg}"
+        if (!hookedPackages.add(hookKey)) {
             return
         }
 
         XposedBridge.log("[VirtualCam] Loaded into scoped target: $pkg (process=${lpparam.processName})")
 
-        // Install both Camera1 and Camera2/Surface hooks; runtime state & bypass are checked dynamically
         runCatching {
             Camera1Hooks.install(lpparam)
         }.onFailure { err ->
@@ -52,6 +50,12 @@ class VirtualCamHookEntry : IXposedHookLoadPackage {
             Camera2Hooks.install(lpparam)
         }.onFailure { err ->
             XposedBridge.log("[VirtualCam] Camera2 hook install warning for $pkg: ${err.message}")
+        }
+
+        runCatching {
+            AudioHooks.install(lpparam)
+        }.onFailure { err ->
+            XposedBridge.log("[VirtualCam] Audio hook install warning for $pkg: ${err.message}")
         }
     }
 

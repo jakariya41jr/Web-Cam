@@ -11,7 +11,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.WeakHashMap
 
 /**
- * Hooks legacy Camera1 (android.hardware.Camera) preview, buffer callbacks, and shutter capture.
+ * Hooks legacy Camera1 (android.hardware.Camera) preview, in-place NV21 callbacks, and shutter capture.
+ * Uses VideoFramePipeline so WebRTC Camera1Session (e.g. OmeTV/WebView) receives 30fps animated frames
+ * in its exact pre-allocated callback buffer reference.
  */
 @Suppress("DEPRECATION")
 object Camera1Hooks {
@@ -19,10 +21,11 @@ object Camera1Hooks {
 
     private val targetSurfaceMap = WeakHashMap<Camera, Surface>()
     private val dummyTextureMap = WeakHashMap<Camera, SurfaceTexture>()
-    private val previewCallbackMap = WeakHashMap<Camera, Camera.PreviewCallback>()
+    private val consumerAcquiredMap = WeakHashMap<Camera, Boolean>()
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         val pkg = lpparam.packageName
+        val processName = lpparam.processName ?: pkg
         val cameraClass = runCatching {
             XposedHelpers.findClass("android.hardware.Camera", lpparam.classLoader)
         }.getOrNull() ?: return
@@ -37,8 +40,8 @@ object Camera1Hooks {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val camera = param.thisObject as? Camera ?: return
                         val holder = param.args.firstOrNull() as? SurfaceHolder ?: return
-                        val state = HookMediaBridge.readRuntimeState(pkg)
-                        if (!state.isActiveForPackage(pkg)) return
+                        val state = HookMediaBridge.readRuntimeState(pkg, processName, forceRefresh = true)
+                        if (!state.isActiveForPackage(pkg, processName)) return
 
                         val surface = holder.surface
                         if (surface != null && surface.isValid) {
@@ -59,15 +62,28 @@ object Camera1Hooks {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val camera = param.thisObject as? Camera ?: return
                         val targetTexture = param.args.firstOrNull() as? SurfaceTexture ?: return
-                        val state = HookMediaBridge.readRuntimeState(pkg)
-                        if (!state.isActiveForPackage(pkg)) return
+                        val state = HookMediaBridge.readRuntimeState(pkg, processName, forceRefresh = true)
+                        if (!state.isActiveForPackage(pkg, processName)) return
 
-                        // Bind a Virtual Surface wrapping the app's SurfaceTexture and hand a dummy
-                        // SurfaceTexture to hardware so the real camera does not overwrite our frames.
+                        runCatching {
+                            val size = camera.parameters?.previewSize
+                            if (size != null && size.width > 0 && size.height > 0) {
+                                targetTexture.setDefaultBufferSize(size.width, size.height)
+                            }
+                        }
+
                         val virtualSurface = Surface(targetTexture)
-                        targetSurfaceMap[camera] = virtualSurface
+                        if (virtualSurface.isValid) {
+                            targetSurfaceMap[camera] = virtualSurface
+                        }
 
-                        val dummy = dummyTextureMap.getOrPut(camera) { SurfaceTexture(0) }
+                        val dummy = dummyTextureMap.getOrPut(camera) {
+                            SurfaceTexture(0).apply {
+                                setOnFrameAvailableListener { tex ->
+                                    runCatching { tex.updateTexImage() }
+                                }
+                            }
+                        }
                         param.args[0] = dummy
                     }
                 }
@@ -82,10 +98,16 @@ object Camera1Hooks {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val camera = param.thisObject as? Camera ?: return
-                        val state = HookMediaBridge.readRuntimeState(pkg)
+                        val state = HookMediaBridge.readRuntimeState(pkg, processName, forceRefresh = true)
+                        if (!state.isActiveForPackage(pkg, processName)) return
+
+                        if (consumerAcquiredMap[camera] != true) {
+                            VideoFramePipeline.acquireConsumer(HookMediaBridge.currentAppContext(), state)
+                            consumerAcquiredMap[camera] = true
+                        }
                         val surface = targetSurfaceMap[camera]
-                        if (state.isActiveForPackage(pkg) && surface != null && surface.isValid) {
-                            HookMediaBridge.startRendererForSurface(surface, pkg, useMediaPlayerForVideo = true)
+                        if (surface != null && surface.isValid) {
+                            HookMediaBridge.startRendererForSurface(surface, pkg, processName)
                         }
                     }
                 }
@@ -104,9 +126,11 @@ object Camera1Hooks {
                             targetSurfaceMap.remove(camera)?.let { surface ->
                                 HookMediaBridge.stopRendererForSurface(surface)
                             }
+                            if (consumerAcquiredMap.remove(camera) == true) {
+                                VideoFramePipeline.releaseConsumer()
+                            }
                             if (methodName == "release") {
-                                dummyTextureMap.remove(camera)?.release()
-                                previewCallbackMap.remove(camera)
+                                runCatching { dummyTextureMap.remove(camera)?.release() }
                             }
                         }
                     }
@@ -114,7 +138,7 @@ object Camera1Hooks {
             }
         }
 
-        // 5. PreviewCallback interception for apps reading raw NV21 frames
+        // 5. PreviewCallback interception for WebRTC / Camera1 NV21 buffers (mutates data in-place)
         val callbackMethods = listOf(
             "setPreviewCallback",
             "setPreviewCallbackWithBuffer",
@@ -128,37 +152,44 @@ object Camera1Hooks {
                     Camera.PreviewCallback::class.java,
                     object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
-                            val camera = param.thisObject as? Camera ?: return
                             val original = param.args.firstOrNull() as? Camera.PreviewCallback ?: return
-                            previewCallbackMap[camera] = original
 
                             param.args[0] = Camera.PreviewCallback { data, cam ->
-                                val state = HookMediaBridge.readRuntimeState(pkg)
-                                if (!state.isActiveForPackage(pkg) || data == null) {
+                                val state = HookMediaBridge.readRuntimeState(pkg, processName)
+                                if (!state.isActiveForPackage(pkg, processName) || data == null) {
                                     original.onPreviewFrame(data, cam)
                                     return@PreviewCallback
                                 }
-                                val size = runCatching { cam.parameters.previewSize }.getOrNull()
-                                val w = size?.width ?: 640
-                                val h = size?.height ?: 480
-                                val bmp = HookMediaBridge.loadBitmapFromActiveMedia(
+
+                                val size = runCatching { cam.parameters?.previewSize }.getOrNull()
+                                val w = size?.width?.takeIf { it > 0 } ?: 640
+                                val h = size?.height?.takeIf { it > 0 } ?: 480
+                                val bmp = VideoFramePipeline.getCurrentFrameBitmap(
                                     HookMediaBridge.currentAppContext(),
-                                    state,
-                                    maxDimension = maxOf(w, h)
+                                    state
                                 )
                                 if (bmp != null) {
-                                    val transformed = HookMediaBridge.applyTransform(
-                                        bmp,
-                                        state.mirrorHorizontal,
-                                        state.rotationDegrees
-                                    )
-                                    val nv21 = HookMediaBridge.bitmapToNv21(transformed, w, h)
-                                    if (transformed !== bmp) transformed.recycle()
-                                    bmp.recycle()
-                                    original.onPreviewFrame(nv21, cam)
-                                } else {
-                                    original.onPreviewFrame(data, cam)
+                                    try {
+                                        val fitted = VideoFramePipeline.renderFittedBitmap(
+                                            source = bmp,
+                                            targetW = w,
+                                            targetH = h,
+                                            mirrorHorizontal = state.mirrorHorizontal,
+                                            rotationDegrees = state.rotationDegrees
+                                        )
+                                        try {
+                                            val nv21 = HookMediaBridge.bitmapToNv21(fitted, w, h)
+                                            // Copy in-place so WebRTC Camera1Session buffer identity check passes
+                                            val copyLen = minOf(nv21.size, data.size)
+                                            System.arraycopy(nv21, 0, data, 0, copyLen)
+                                        } finally {
+                                            fitted.recycle()
+                                        }
+                                    } finally {
+                                        bmp.recycle()
+                                    }
                                 }
+                                original.onPreviewFrame(data, cam)
                             }
                         }
                     }
@@ -166,7 +197,7 @@ object Camera1Hooks {
             }
         }
 
-        // 6. takePicture(ShutterCallback, PictureCallback raw, PictureCallback postview, PictureCallback jpeg)
+        // 6. takePicture(...)
         runCatching {
             XposedHelpers.findAndHookMethod(
                 cameraClass,
@@ -178,12 +209,12 @@ object Camera1Hooks {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val camera = param.thisObject as? Camera ?: return
-                        val state = HookMediaBridge.readRuntimeState(pkg)
-                        if (!state.isActiveForPackage(pkg)) return
+                        val state = HookMediaBridge.readRuntimeState(pkg, processName, forceRefresh = true)
+                        if (!state.isActiveForPackage(pkg, processName)) return
 
                         val shutter = param.args[0] as? Camera.ShutterCallback
                         val jpegCallback = param.args[3] as? Camera.PictureCallback
-                        val jpegBytes = HookMediaBridge.encodeJpegFromActiveMedia(pkg)
+                        val jpegBytes = HookMediaBridge.encodeJpegFromActiveMedia(pkg, processName)
                         if (jpegBytes != null && jpegCallback != null) {
                             shutter?.onShutter()
                             jpegCallback.onPictureTaken(jpegBytes, camera)
@@ -194,6 +225,6 @@ object Camera1Hooks {
             )
         }
 
-        XposedBridge.log("$TAG Installed Camera1 hooks for $pkg")
+        XposedBridge.log("$TAG Installed Camera1 hooks for $pkg (process=$processName)")
     }
 }

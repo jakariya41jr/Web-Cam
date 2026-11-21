@@ -2,6 +2,8 @@
 <resources>
     <string-array name="xposed_scope">
         <item>com.whatsapp</item>
+        <item>com.imo.android.imoim</item>
+        <item>omegle.tv</item>
         <item>com.facebook.orca</item>
         <item>com.instagram.android</item>
         <item>org.telegram.messenger</item>

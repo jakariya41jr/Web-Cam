@@ -8,6 +8,7 @@ import com.example.model.MediaKind
 import com.example.model.SelectedMediaInfo
 import com.example.model.VirtualCamConstants
 import com.example.provider.VirtualCamMediaProvider
+import com.example.xposed.HookRuntimeState
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -31,7 +32,7 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `repository persists toggles and selected media metadata`() {
+    fun `repository persists audio, mic, and selected media metadata`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val repo = VirtualCamRepository(context)
 
@@ -44,7 +45,8 @@ class ExampleRobolectricTest {
             repo.loadConfig().copy(
                 enabled = true,
                 forceBypass = false,
-                audioEnabled = false,
+                audioEnabled = true,
+                micEnabled = false,
                 loopVideo = true,
                 mirrorHorizontal = true,
                 rotationDegrees = 90,
@@ -64,7 +66,8 @@ class ExampleRobolectricTest {
         assertTrue(saved.isEffectivelyArmed)
         val reloaded = repo.loadConfig()
         assertTrue(reloaded.enabled)
-        assertFalse(reloaded.audioEnabled)
+        assertTrue(reloaded.audioEnabled)
+        assertFalse(reloaded.micEnabled)
         assertTrue(reloaded.mirrorHorizontal)
         assertEquals(90, reloaded.rotationDegrees)
         assertEquals(MediaKind.VIDEO, reloaded.selectedMedia.kind)
@@ -72,7 +75,22 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `media provider exposes config cursor safely`() {
+    fun `webview process resolves to target host package`() {
+        val state = HookRuntimeState(
+            enabled = true,
+            forceBypass = false,
+            allowAllScopedApps = false,
+            mediaKind = MediaKind.VIDEO,
+            enabledPackages = setOf("omegle.tv", "com.imo.android.imoim")
+        )
+
+        assertTrue(state.isActiveForPackage("com.google.android.webview", "omegle.tv"))
+        assertTrue(state.isActiveForPackage("com.google.android.webview", "com.imo.android.imoim"))
+        assertFalse(state.isActiveForPackage("com.google.android.webview", "com.unscoped.browser"))
+    }
+
+    @Test
+    fun `media provider exposes audio and mic config columns`() {
         val controller = Robolectric.buildContentProvider(VirtualCamMediaProvider::class.java)
             .create(VirtualCamConstants.PROVIDER_AUTHORITY)
         val provider = controller.get()
@@ -88,6 +106,7 @@ class ExampleRobolectricTest {
         cursor!!.use {
             assertTrue(it.moveToFirst())
             assertTrue(it.getColumnIndex(VirtualCamConstants.KEY_AUDIO_ENABLED) >= 0)
+            assertTrue(it.getColumnIndex(VirtualCamConstants.KEY_MIC_ENABLED) >= 0)
             assertTrue(it.getColumnIndex(VirtualCamConstants.KEY_MEDIA_KIND) >= 0)
         }
     }

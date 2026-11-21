@@ -1,6 +1,6 @@
 <resources>
     <string name="app_name">VirtualCam</string>
-    <string name="xposed_description">PCam-style LSPosed Virtual Camera module for Android 11–15+ with in-app video/photo picker, audio toggle, and Camera1/Camera2/Surface injection.</string>
+    <string name="xposed_description">PCam-style LSPosed Virtual Camera module for Android 11–15+ with in-app video/photo picker, call audio &amp; mic routing, floating quick-switch overlay, and Camera1/Camera2/ImageReader/WebRTC injection.</string>
     <string name="nav_studio">Studio</string>
     <string name="nav_scopes">Scopes</string>
     <string name="nav_notes">Notes</string>
@@ -10,4 +10,7 @@
     <string name="action_clear_media">Clear Media</string>
     <string name="action_quick_bypass">Bypass</string>
     <string name="action_enable_hook">Enable</string>
+    <string name="overlay_notification_channel">VirtualCam Overlay Controls</string>
+    <string name="overlay_notification_title">VirtualCam Quick Switch Active</string>
+    <string name="overlay_notification_text">Tap the floating pill to switch between Virtual and Real Camera during calls.</string>
 </resources>

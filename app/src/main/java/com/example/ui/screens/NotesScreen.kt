@@ -16,6 +16,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.FolderSpecial
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Security
@@ -55,41 +57,47 @@ fun NotesScreen(
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             NoteCard(
+                icon = Icons.Default.CameraAlt,
+                title = "Imo Crash & WhatsApp/OmeTV Black Screen Fix",
+                tag = "VideoFramePipeline",
+                body = "• MediaCodec + ImageWriter Pipeline: Replaces fragile MediaPlayer.setSurface() on Camera2/ImageReader surfaces (which caused 'Video renderer fallback: null') with a dedicated MediaCodec YUV_420_888 decoder feeding ImageWriter at 30fps and Canvas preview surfaces.\n• SessionConfiguration Replacement: Rewrites API 28+ SessionConfiguration and CaptureRequest.Builder.addTarget(...) consistently with a per-device draining bridge surface so CameraCaptureSession never mismatches outputs or crashes Imo.\n• WebRTC Buffer Identity: Camera1.setPreviewCallbackWithBuffer mutates the app's registered NV21 byte[] in-place and resolves com.google.android.webview host processes (omegle.tv, imo)."
+            )
+
+            NoteCard(
+                icon = Icons.Default.GraphicEq,
+                title = "Independent Video Sound & Device Mic Routing",
+                tag = "AudioRecord Hooks",
+                body = "AudioHooks intercepts AudioRecord.read(...) inside scoped call apps. Toggle 'Main Device Microphone' off to zero out hardware mic samples cleanly, and toggle 'Video Audio (Send to Call)' on to decode and resample the selected video's audio track directly into the call stream without acoustic speaker echo."
+            )
+
+            NoteCard(
+                icon = Icons.Default.Layers,
+                title = "Floating Quick-Switch Overlay",
+                tag = "SYSTEM_ALERT_WINDOW",
+                body = "Grant Display Over Other Apps to launch a draggable floating pill over WhatsApp, Imo, or OmeTV. Tap the pill to toggle Virtual Camera vs. Real Camera instantaneously without restarting the call, or expand it for live Video Sound and Device Mic switches."
+            )
+
+            NoteCard(
                 icon = Icons.Default.FolderSpecial,
                 title = "Scoped Storage & Zero-Permission Media Picker",
                 tag = "Android 11–15+",
-                body = "Instead of requesting deprecated READ_EXTERNAL_STORAGE or broad READ_MEDIA_* permissions, VirtualCam uses Android Photo Picker (PickVisualMedia) and Storage Access Framework (OpenDocument). Picked streams are copied into internal filesDir/virtual_cam_media/active_media.* so URI grants never expire across process restarts."
+                body = "Uses Android Photo Picker (PickVisualMedia) and Storage Access Framework (OpenDocument). Picked streams are copied into internal filesDir/virtual_cam_media/active_media.* so URI grants never expire across process restarts."
             )
 
             NoteCard(
                 icon = Icons.Default.Lock,
                 title = "New XSharedPreferences & ContentProvider Bridge",
                 tag = if (config.worldReadableActive) "WORLD_READABLE OK" else "FALLBACK MODE",
-                body = "AndroidManifest declares xposedminversion=93 and xposedsharedprefs=true. When LSPosed is active, MODE_WORLD_READABLE writes are transparently proxied to hooked apps via XSharedPreferences. Additionally, VirtualCamMediaProvider (${VirtualCamConstants.ACTIVE_MEDIA_URI}) serves read-only ParcelFileDescriptors across app sandboxes."
-            )
-
-            NoteCard(
-                icon = Icons.Default.CameraAlt,
-                title = "Camera1 & Camera2 / Surface Pipeline",
-                tag = "Hook Targets",
-                body = "• Camera1: Intercepts setPreviewDisplay, setPreviewTexture, startPreview, NV21 PreviewCallback, and takePicture JPEG callbacks.\n• Camera2: Wraps CameraManager.openCamera callbacks, redirects createCaptureSession / CaptureRequest.Builder.addTarget surfaces to VirtualFrameRenderer, and guards SessionConfiguration (API 28+) & OutputConfiguration (API 24+).\n• MediaRecorder & ImageReader: Tracks getSurface() targets and honors live audio (no-silent) and quick bypass switches."
+                body = "AndroidManifest declares xposedminversion=93 and xposedsharedprefs=true. MODE_WORLD_READABLE writes are proxied to hooked apps via XSharedPreferences, backed by VirtualCamMediaProvider (${VirtualCamConstants.ACTIVE_MEDIA_URI})."
             )
 
             NoteCard(
                 icon = Icons.Default.Security,
-                title = "SELinux, Zygisk & Package Visibility",
-                tag = "Zygisk / LSPlant",
-                body = "Under Android 11–15 SELinux (untrusted_app), hooked apps cannot directly open another app's /data/user/0/<pkg>/files path. Zygisk + LSPosed (LSPlant) executes hooks inside the target app's Dalvik/ART process, where New XSharedPreferences uses Binder IPC and ContentResolver streams the active media file descriptor safely."
-            )
-
-            NoteCard(
-                icon = Icons.Default.Memory,
-                title = "Quick Diagnostics",
+                title = "SELinux & LSPosed Scope Notes",
                 tag = "Runtime",
-                body = "Package: ${VirtualCamConstants.MODULE_PACKAGE}\n" +
-                    "Entry: com.example.xposed.VirtualCamHookEntry\n" +
-                    "Prefs Mode: ${if (config.worldReadableActive) "MODE_WORLD_READABLE" else "MODE_PRIVATE (LSPosed inactive)"}\n" +
-                    "Provider URI: ${VirtualCamConstants.ACTIVE_MEDIA_URI}"
+                body = "Make sure target apps (WhatsApp, imo, OmeTV, System WebView if applicable) are checked in LSPosed Manager under Modules → VirtualCam.\n" +
+                    "Package: ${VirtualCamConstants.MODULE_PACKAGE}\n" +
+                    "Prefs Mode: ${if (config.worldReadableActive) "MODE_WORLD_READABLE" else "MODE_PRIVATE (LSPosed inactive)"}"
             )
 
             Spacer(modifier = Modifier.height(12.dp))

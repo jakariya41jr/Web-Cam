@@ -37,7 +37,10 @@ import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Flip
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Loop
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
@@ -85,7 +88,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.R
 import com.example.model.MediaKind
-import com.example.model.SelectedMediaInfo
 import com.example.model.VirtualCamConfig
 import com.example.ui.VirtualCamUiState
 import java.io.File
@@ -103,10 +105,13 @@ fun StudioScreen(
     onToggleEnabled: (Boolean) -> Unit,
     onToggleQuickBypass: () -> Unit,
     onToggleAudio: (Boolean) -> Unit,
+    onToggleMic: (Boolean) -> Unit,
     onToggleLoop: (Boolean) -> Unit,
     onToggleMirror: (Boolean) -> Unit,
     onCycleRotation: () -> Unit,
     onTogglePreviewPlaying: () -> Unit,
+    onRequestOverlayPermission: () -> Unit,
+    onToggleFloatingOverlay: (Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val config = state.config
@@ -147,9 +152,17 @@ fun StudioScreen(
                 onClearMedia = onClearMedia
             )
 
+            FloatingOverlayCard(
+                canDrawOverlays = state.canDrawOverlays,
+                overlayRunning = config.overlayRunning,
+                onRequestOverlayPermission = onRequestOverlayPermission,
+                onToggleFloatingOverlay = onToggleFloatingOverlay
+            )
+
             PipelineControlsCard(
                 config = config,
                 onToggleAudio = onToggleAudio,
+                onToggleMic = onToggleMic,
                 onToggleLoop = onToggleLoop,
                 onToggleMirror = onToggleMirror,
                 onCycleRotation = onCycleRotation
@@ -177,7 +190,7 @@ private fun HookStatusBanner(
     )
 
     val statusTitle = when {
-        config.forceBypass -> "BYPASS ACTIVE"
+        config.forceBypass -> "BYPASS ACTIVE (REAL CAMERA)"
         config.isEffectivelyArmed -> "FEED ARMED"
         config.enabled -> "AWAITING MEDIA"
         else -> "INJECTION STANDBY"
@@ -185,7 +198,7 @@ private fun HookStatusBanner(
 
     val statusSubtitle = when {
         config.forceBypass -> "Passing real hardware camera frames"
-        config.isEffectivelyArmed -> "Injecting ${config.selectedMedia.kind.wireValue} into Camera1 & Camera2"
+        config.isEffectivelyArmed -> "Injecting ${config.selectedMedia.kind.wireValue} into Camera1 / Camera2 / ImageReader"
         config.enabled -> "Select a video or photo below to activate stream"
         else -> "Toggle Virtual Camera on to intercept scoped apps"
     }
@@ -299,6 +312,85 @@ private fun HookStatusBanner(
     }
 }
 
+@Composable
+private fun FloatingOverlayCard(
+    canDrawOverlays: Boolean,
+    overlayRunning: Boolean,
+    onRequestOverlayPermission: () -> Unit,
+    onToggleFloatingOverlay: (Boolean) -> Unit
+) {
+    Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Layers,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.secondary
+                    )
+                    Column {
+                        Text(
+                            text = "Floating Quick-Switch Overlay",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Text(
+                            text = if (canDrawOverlays) {
+                                "Switch Virtual/Real camera, Video Sound, and Mic live over calls"
+                            } else {
+                                "Requires Display Over Other Apps permission"
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                if (canDrawOverlays) {
+                    Switch(
+                        checked = overlayRunning,
+                        onCheckedChange = onToggleFloatingOverlay,
+                        modifier = Modifier.testTag("overlay_toggle_switch")
+                    )
+                }
+            }
+
+            if (!canDrawOverlays) {
+                Button(
+                    onClick = onRequestOverlayPermission,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("overlay_permission_button"),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Layers,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Grant Display Over Other Apps")
+                }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ViewfinderPreviewCard(
@@ -403,7 +495,6 @@ private fun ViewfinderPreviewCard(
                     }
                 }
 
-                // Studio reticle corners overlay
                 ViewfinderReticleOverlay(
                     accentColor = if (config.isEffectivelyArmed) {
                         MaterialTheme.colorScheme.primary
@@ -412,7 +503,6 @@ private fun ViewfinderPreviewCard(
                     }
                 )
 
-                // Top-left live feed pill + top-right play/pause button for video
                 if (media.hasMedia && !isImporting) {
                     Surface(
                         color = Color.Black.copy(alpha = 0.68f),
@@ -421,11 +511,13 @@ private fun ViewfinderPreviewCard(
                             .align(Alignment.TopStart)
                             .padding(10.dp)
                     ) {
+                        val micTag = if (config.micEnabled) "MIC ON" else "MIC MUTE"
                         Text(
                             text = if (media.kind == MediaKind.VIDEO) {
-                                if (config.audioEnabled) "VID • AUDIO ON" else "VID • SILENT"
+                                val vidAudio = if (config.audioEnabled) "VID SOUND" else "VID MUTE"
+                                "$vidAudio • $micTag"
                             } else {
-                                "STILL FRAME"
+                                "STILL FRAME • $micTag"
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.primary,
@@ -454,7 +546,6 @@ private fun ViewfinderPreviewCard(
                 }
             }
 
-            // Metadata Telemetry Strip
             if (media.hasMedia) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
@@ -582,16 +673,12 @@ private fun ViewfinderReticleOverlay(accentColor: Color) {
         val corner = 18.dp.toPx()
         val pad = 10.dp.toPx()
 
-        // Top-left
         drawLine(accentColor, Offset(pad, pad), Offset(pad + corner, pad), stroke)
         drawLine(accentColor, Offset(pad, pad), Offset(pad, pad + corner), stroke)
-        // Top-right
         drawLine(accentColor, Offset(size.width - pad, pad), Offset(size.width - pad - corner, pad), stroke)
         drawLine(accentColor, Offset(size.width - pad, pad), Offset(size.width - pad, pad + corner), stroke)
-        // Bottom-left
         drawLine(accentColor, Offset(pad, size.height - pad), Offset(pad + corner, size.height - pad), stroke)
         drawLine(accentColor, Offset(pad, size.height - pad), Offset(pad, size.height - pad - corner), stroke)
-        // Bottom-right
         drawLine(accentColor, Offset(size.width - pad, size.height - pad), Offset(size.width - pad - corner, size.height - pad), stroke)
         drawLine(accentColor, Offset(size.width - pad, size.height - pad), Offset(size.width - pad, size.height - pad - corner), stroke)
     }
@@ -718,6 +805,7 @@ private fun MediaPickerDeck(
 private fun PipelineControlsCard(
     config: VirtualCamConfig,
     onToggleAudio: (Boolean) -> Unit,
+    onToggleMic: (Boolean) -> Unit,
     onToggleLoop: (Boolean) -> Unit,
     onToggleMirror: (Boolean) -> Unit,
     onCycleRotation: () -> Unit
@@ -732,21 +820,34 @@ private fun PipelineControlsCard(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text(
-                text = "Signal & Optics Pipeline",
+                text = "Audio Routing & Optics Pipeline",
                 style = MaterialTheme.typography.titleMedium
             )
 
             ControlToggleRow(
                 icon = if (config.audioEnabled) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
-                title = "Audio Playback (no-silent)",
+                title = "Video Audio (Send to Call)",
                 subtitle = if (config.audioEnabled) {
-                    "Video audio track active on MediaPlayer / MediaRecorder"
+                    "Injects video sound directly into call AudioRecord stream"
                 } else {
-                    "Muted video feed (silent mode)"
+                    "Video audio muted (silent video feed)"
                 },
                 checked = config.audioEnabled,
                 onCheckedChange = onToggleAudio,
                 testTag = "audio_playback_switch"
+            )
+
+            ControlToggleRow(
+                icon = if (config.micEnabled) Icons.Default.Mic else Icons.Default.MicOff,
+                title = "Main Device Microphone",
+                subtitle = if (config.micEnabled) {
+                    "Your phone microphone sound is active in calls"
+                } else {
+                    "Device microphone muted (only video audio if enabled)"
+                },
+                checked = config.micEnabled,
+                onCheckedChange = onToggleMic,
+                testTag = "main_mic_switch"
             )
 
             ControlToggleRow(

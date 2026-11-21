@@ -2,6 +2,7 @@ package com.example.data
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
@@ -108,10 +109,12 @@ class VirtualCamRepository(private val context: Context) {
             enabled = prefs.getBoolean(VirtualCamConstants.KEY_ENABLED, false),
             forceBypass = prefs.getBoolean(VirtualCamConstants.KEY_FORCE_BYPASS, false),
             audioEnabled = prefs.getBoolean(VirtualCamConstants.KEY_AUDIO_ENABLED, true),
+            micEnabled = prefs.getBoolean(VirtualCamConstants.KEY_MIC_ENABLED, true),
             loopVideo = prefs.getBoolean(VirtualCamConstants.KEY_LOOP_VIDEO, true),
             mirrorHorizontal = prefs.getBoolean(VirtualCamConstants.KEY_MIRROR_HORIZONTAL, false),
             rotationDegrees = prefs.getInt(VirtualCamConstants.KEY_ROTATION_DEGREES, 0),
             allowAllScopedApps = prefs.getBoolean(VirtualCamConstants.KEY_ALLOW_ALL_SCOPED, true),
+            overlayRunning = prefs.getBoolean(VirtualCamConstants.KEY_OVERLAY_RUNNING, false),
             selectedMedia = selectedMedia,
             targetApps = builtInTargets + customTargets,
             worldReadableActive = worldReadable,
@@ -129,10 +132,12 @@ class VirtualCamRepository(private val context: Context) {
             putBoolean(VirtualCamConstants.KEY_ENABLED, config.enabled)
             putBoolean(VirtualCamConstants.KEY_FORCE_BYPASS, config.forceBypass)
             putBoolean(VirtualCamConstants.KEY_AUDIO_ENABLED, config.audioEnabled)
+            putBoolean(VirtualCamConstants.KEY_MIC_ENABLED, config.micEnabled)
             putBoolean(VirtualCamConstants.KEY_LOOP_VIDEO, config.loopVideo)
             putBoolean(VirtualCamConstants.KEY_MIRROR_HORIZONTAL, config.mirrorHorizontal)
             putInt(VirtualCamConstants.KEY_ROTATION_DEGREES, config.rotationDegrees)
             putBoolean(VirtualCamConstants.KEY_ALLOW_ALL_SCOPED, config.allowAllScopedApps)
+            putBoolean(VirtualCamConstants.KEY_OVERLAY_RUNNING, config.overlayRunning)
 
             putString(VirtualCamConstants.KEY_MEDIA_KIND, config.selectedMedia.kind.wireValue)
             putString(VirtualCamConstants.KEY_MEDIA_NAME, config.selectedMedia.displayName)
@@ -147,12 +152,18 @@ class VirtualCamRepository(private val context: Context) {
 
             putStringSet(VirtualCamConstants.KEY_ENABLED_PACKAGES, enabledSet)
             putStringSet(VirtualCamConstants.KEY_CUSTOM_PACKAGES, customSet)
-            apply()
+            commit()
         }
 
-        // Notify any observers of the VirtualCamMediaProvider
+        // Notify ContentResolver observers & local in-app components (FloatingControlService / MainActivity)
         runCatching {
             context.contentResolver.notifyChange(Uri.parse(VirtualCamConstants.ACTIVE_CONFIG_URI), null)
+        }
+        runCatching {
+            val intent = Intent(VirtualCamConstants.ACTION_CONFIG_CHANGED).apply {
+                setPackage(context.packageName)
+            }
+            context.sendBroadcast(intent)
         }
 
         return config.copy(
@@ -208,7 +219,6 @@ class VirtualCamRepository(private val context: Context) {
                     ?.takeIf { it.isNotBlank() }
                     ?: displayName.substringAfterLast('.', if (detectedKind == MediaKind.VIDEO) "mp4" else "jpg")
 
-                // Remove older active media files to keep internal storage clean
                 mediaDirectory.listFiles()?.forEach { oldFile ->
                     if (oldFile.name.startsWith("active_media.")) {
                         oldFile.delete()
@@ -222,7 +232,6 @@ class VirtualCamRepository(private val context: Context) {
                     }
                 } ?: error("Unable to open selected media stream")
 
-                // Make the copied media readable by the exported provider and local preview
                 destFile.setReadable(true, false)
 
                 val actualSize = if (destFile.length() > 0L) destFile.length() else reportedSize
