@@ -19,3 +19,15 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# Preserve Xposed entry point instantiated reflectively by LSPosed from assets/xposed_init
+-keep class com.example.xposed.VirtualCamHookEntry {
+    public <init>();
+    public void handleLoadPackage(...);
+}
+
+# Preserve self-hook status helper methods
+-keepclassmembers class com.example.xposed.ModuleStatus {
+    public static boolean isModuleActive();
+    public static int getXposedApiVersion();
+}

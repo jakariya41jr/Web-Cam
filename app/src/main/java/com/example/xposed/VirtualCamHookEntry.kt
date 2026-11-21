@@ -7,22 +7,35 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 
+import java.util.concurrent.ConcurrentHashMap
+
 /**
  * Primary Xposed / LSPosed entry point declared in assets/xposed_init.
+ * Intercepts target package loading and installs Camera1 & Camera2/Surface hooks.
  */
 class VirtualCamHookEntry : IXposedHookLoadPackage {
 
+    private val hookedPackages = ConcurrentHashMap.newKeySet<String>()
+
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         val pkg = lpparam.packageName ?: return
+        if (lpparam.classLoader == null) return
 
         // Self-hook so VirtualCam UI accurately reflects LSPosed activation status
         if (pkg == VirtualCamConstants.MODULE_PACKAGE) {
-            hookModuleSelfStatus(lpparam)
+            if (hookedPackages.add(pkg)) {
+                hookModuleSelfStatus(lpparam)
+            }
             return
         }
 
         // Skip system/framework processes unless explicitly scoped
         if (pkg == "android" || pkg == "com.android.systemui") {
+            return
+        }
+
+        // Avoid duplicate hook registration if handleLoadPackage fires multiple times for split APKs
+        if (!hookedPackages.add(pkg)) {
             return
         }
 
