@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="xposed_scope">
+        <item>com.whatsapp</item>
+        <item>com.facebook.orca</item>
+        <item>com.instagram.android</item>
+        <item>org.telegram.messenger</item>
+        <item>com.snapchat.android</item>
+        <item>com.discord</item>
+        <item>com.google.android.apps.tachyon</item>
+        <item>com.android.camera</item>
+        <item>com.google.android.GoogleCamera</item>
+        <item>com.aistudio.virtualcam.xkpzqm</item>
+    </string-array>
+</resources>

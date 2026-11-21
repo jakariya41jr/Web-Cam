@@ -1,0 +1,6 @@
+{
+  "name": "VirtualCam",
+  "description": "LSPosed Virtual Camera prototype module for Android 11-15+ with an in-app media picker, live viewfinder preview, and Camera1/Camera2/Surface hooks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

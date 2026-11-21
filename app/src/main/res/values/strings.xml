@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">VirtualCam</string>
+    <string name="xposed_description">PCam-style LSPosed Virtual Camera module for Android 11–15+ with in-app video/photo picker, audio toggle, and Camera1/Camera2/Surface injection.</string>
+    <string name="nav_studio">Studio</string>
+    <string name="nav_scopes">Scopes</string>
+    <string name="nav_notes">Notes</string>
+    <string name="action_pick_video">Pick Video</string>
+    <string name="action_pick_photo">Pick Photo</string>
+    <string name="action_pick_document">Browse Files</string>
+    <string name="action_clear_media">Clear Media</string>
+    <string name="action_quick_bypass">Bypass</string>
+    <string name="action_enable_hook">Enable</string>
+</resources>
